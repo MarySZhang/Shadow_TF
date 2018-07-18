@@ -1,8 +1,18 @@
+'''
+working log （2018/07/18）：
+to do：
+    load images and json files (SYNCHRONIZE!)
+    conditional input for discriminators
+    processing 4-channel output of generator
+    changing loss functions
+'''
+
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
 import tensorflow as tf
+import tfimage as im
 import numpy as np
 import argparse
 import os
@@ -38,8 +48,8 @@ gan_weight = 1.0
 EPS = 1e-12
 CROP_SIZE = 256
 
-Examples = collections.namedtuple("Examples", "paths, inputs, targets, masks, count, steps_per_epoch")
-Model = collections.namedtuple("Model", "outputs, predict_real, predict_fake, discrim_loss, discrim_grads_and_vars, gen_loss_GAN, gen_loss_L1, gen_grads_and_vars, train")
+Examples = collections.namedtuple("Examples", "paths, inputs, targets, bounds, count, steps_per_epoch")
+Model = collections.namedtuple("Model", "outputs, local_predict_real, local_predict_fake, global_predict_real, global_predict_fake, local_discrim_loss, local_discrim_grads_and_vars, global_discrim_loss, global_discrim_grads_and_vars, gen_loss_local, gen_loss_global, gen_loss_L1, gen_grads_and_vars, train")
 
 def preprocess(image):
     with tf.name_scope("preprocess"):
@@ -49,46 +59,79 @@ def deprocess(image):
     with tf.name_scope("deprocess"):
         return (image + 1) / 2
 
-def localize(images, masks):
+def localize(images, bounds):
+    #as long as images and bounds are paired up
     imgs = []
     for i in range(len(images)):
         temp = images[i]
-        center_idx = center_idxes[i]
+        c_row = bounds[i][0] + (bounds[i][1] - bounds[i][0]) // 2
+        c_col = bounds[i][2] + (bounds[i][3] - bounds[i][2]) // 2
+        if c_row < 128:
+            c_row = 128
+        elif c_row > 383:
+            c_row = 383
 
-        if center_idx['x'] < 64:
-            left_bound = 0
-            right_bound = 127
-        elif center_idx['x'] > 191:
-            left_bound = 128
-            right_bound = 255
-        else:
-            left_bound = center_idx['x'] - 64
-            right_bound = center_idx['x'] + 64
-
-        if center_idx['y'] < 64:
-            up_bound = 0
-            low_bound = 127
-        elif center_idx['y'] > 191:
-            up_bound = 128
-            low_bound = 255
-        else:
-            up_bound = center_idx['y'] - 64
-            low_bound = center_idx['y'] + 64
-
-        img = temp[up_bound:low_bound, left_bound:right_bound, : ]
+        if c_col < 128:
+            c_col = 128
+        elif: c_col > 383:
+            c_col = 383
+            
+        img = temp[c_row-128:c_row+128, c_col-128:c_col+128, : ]
         imgs.append(img)
     return imgs
 
-def discrim_conv(batch_input, out_channels, stride):
-    padded_input = tf.pad(batch_input, [[0, 0], [1, 1], [1, 1], [0, 0]], mode="CONSTANT")
-    return tf.layers.conv2d(padded_input, out_channels, kernal_size=4, strides=(stride, stride), padding="valid", kernal_initializer=tf.random_normal_initializer(0, 0.02))
-        
-def gen_conv(batch_input, out_channels):
-    initializer = tf.random_normal_initializer(0, 0.02)
-    return tf.layers.conv2d(batch_input, out_channels, kernel_size=4, strides=(2, 2), padding="same", kernal_initializer=initializer)
+def discrim_conv(batch_input, out_channels, stride, name="dis_conv2d"):
+    input_shape = batch_input.get_shape().as_list()
+    with tf.variable_scope(name) as scope:
+        w = tf.get_variable("w", [5, 5, input_shape[-1], out_channels], initializer=tf.random_normal_initializer(stddev=0.02))
+        b = tf.get_variable("b", [out_channels], initializer=tf.constant_initializer(0.0))
+        conv = tf.nn.conv2d(batch_input, w, strides=[1, stride, stride, 1], padding="VALID")
+        output = batchnorm(output)
+        output = tf.nn.relu(output)
+        return output
+            
+def gen_conv(batch_input, out_channels, kernel=3, stride=2, function="relu", name="gen_conv2d"):
+    input_shape = batch_input.get_shape().as_list()
+    with tf.variable_scope(name) as scope:
+        w = tf.get_variable("w", [kernel, kernel, input_shape[-1], out_channels], initializer=tf.random_normal_initializer(stddev=0.02))
+        b = tf.get_variable("b", [out_channels], initializer=tf.constant_initializer(0.0))
+        conv = tf.nn.conv2d(batch_input, w, strides=[1, stride, stride, 1], padding="SAME")
+        conv = tf.reshape(tf.nn.bias_add(conv, b), conv.get_shape())
+        output = batchnorm(output)
+        if function == "relu":
+            output = tf.nn.relu(output)
+        elif function == "tanh":
+            output = tf.nn.tanh(output)
+        else:
+            raise Exception("Invalid function")
 
-def gen_deconv(batch_input, out_channels):
-    return tf.layers.conv2d_transpose(batch_input, out_channels, kernel_size=4, strides=(2, 2), padding="same", kernel_initializer=tf.random_normal_initializer(0, 0.02))
+        return output
+
+def gen_deconv(batch_input, connect_input, out_channels, out_height, name="gen_deconv"):
+    if connect_input == None:
+        inputs = batch_input
+    else:
+        inputs = tf.concat([batch_input, connect_input], axis=3)
+    inputs = tf.nn.relu(inputs)
+    input_shape = inputs.get_shape().as_list()
+    with tf.variable_scope(name) as scope:
+        w = tf.get_variable("w", [4, 4, out_channels, input_shape[-1]], initializer=tf.random_normal_initializer(stddev=0.02))
+        b = tf.get_variable("b", [out_channels], initializer=tf.constant_initializer(0.0))
+        deconv = tf.nn.conv2d_transpose(inputs, w, output_shape=[batch_size, out_height, out_height, out_channels], strides=[1, 2, 2, 1], padding="SAME")
+        deconv = tf.reshape(tf.nn.bias_add(deconv, b), deconv.get_shape())
+        output = batchnorm(deconv)
+        return output
+
+def gen_dilate_conv(batch_input, rate, name="gen_dilate_conv"):
+    input_shape = batch_input.get_shape().as_list()
+    out_shape = [batch_size, input_shape[1], input_shape[2], input_shape[-1]]
+    with tf.variable_scope(name) as scope:
+        w = tf.get_variable("w", [3, 3, input_shape[-1], out_shape[-1]], initializer=tf.random_normal_initializer(stddev=0.02))
+        b = tf.get_variable("b", [out_shape[-1]], initializer=tf.constant_initializer(0.0))
+        dilate_conv = tf.nn.atrous_conv2d(batch_input, w, rate=rate, padding="SAME")
+        dilate_conv = tf.reshape(tf.nn.bias_add(dilate_conv, b), dilate_conv.get_shape())
+        return dilate_conv
+    
 
 def lrelu(x, a):
     with tf.name_scope("lrelu"):
@@ -106,25 +149,33 @@ def load_examples():
     def get_path(name):
         return glob.glob(os.path.join(a.input_dir, name))
 
-    img_input_paths = get_path("*.png")
-    obj_1_input_paths = get_path("*objectMask1.png")
-    obj_2_input_paths = get_path("*objectMask2.png")
-    obj_3_input_paths = get_path("*objectMask3.png")
-    sha_1_input_paths = get_path("*shadowMask1.png")
-    sha_2_input_paths = get_path("*shadowMask2.png")
-    sha_3_input_paths = get_path("*shadowMask3.png")
-    obj_0_input_paths = get_path("*objectMask.png")
-    gt_input_paths = get_path("*truth.png")
-    
-    all_paths = [img_input_paths,
-                 obj_1_input_paths,
-                 obj_2_input_paths,
-                 obj_3_input_paths,
-                 sha_1_input_paths,
-                 sha_2_input_paths,
-                 sha_3_input_paths,
-                 obj_0_input_paths,
-                 gt_input_paths]
+
+    '''
+    -----------------------------------------------------------------------
+    modify paths here
+        -input(3 channels)
+        -o1, s1, o2, s2, o3, s3
+        -O
+        -gt(3 channels)
+        problems:
+            *using tf.train.string_input_producer, randomly shuffles each paths every epoch. So image sets are not in sync
+            *try to put images together (e.g. in a folder, or as a larger image) -- then okay
+            *the implementation below assumes images are concatenated into a 512 by (512*13) greyscale image
+
+            *but *bounds.json files still cannot be synchronized with shuffle
+    read in all .json files, store bounds in list
+    -----------------------------------------------------------------------
+    '''
+ 
+    input_paths = get_path("*.png")
+
+    bounds = []
+    for i in range(len(input_paths)):
+        filename = "%dbounds.json" % i
+        with open(filename, "w") as json_file:
+            data = json.load(json_file)
+            bound = [data["up"], data["low"], data["left"], data["right"]]
+            bounds.append(bound)
     
     decode = tf.image.decode_png
 
@@ -132,209 +183,213 @@ def load_examples():
         name, _ = os.path.splitext(os.path.basename(path))
         return name
 
-    for input_paths in all_paths:
-        if all(get_name(path).isdigit() for path in input_paths):
-            input_paths = sorted(input_paths, key=lambda path: int(get_name(path)))
-        else:
-            input_paths = sorted(input_paths)
+    input_paths = sorted(input_paths, key=lambda path: int(get_name(input_paths)))
 
-    def load_images(input_paths):
+
+    with tf.name_scope("load_images"):
         path_queue = tf.train.string_input_producer(input_paths, shuffle=a.mode == "train")
         reader = tf.WholeFileReader()
         paths, contents = reader.read(path_queue)
         raw_input = decode(contents)
         raw_input = tf.image.convert_image_dtype(raw_input, dtype=tf.float32)
         raw_input = preprocess(raw_input)
-        return raw_input
 
-    with tf.name_scope("load_images"):
-        images = load_images(img_input_paths)
-        #separate three channels of images
-        img_r = images[:,:,0]
-        img_g = images[:,:,1]
-        img_b = images[:,:,2]
-        obj_1 = load_images(obj_1_input_paths)
-        obj_2 = load_images(obj_2_input_paths)
-        obj_3 = load_images(obj_3_input_paths)
-        sha_1 = load_images(sha_1_input_paths)
-        sha_2 = load_images(sha_2_input_paths)
-        sha_3 = load_images(sha_3_input_paths)
-        obj_0 = load_images(obj_0_input_paths)
-        targets = load_images(gt_input_paths)
-        targets.set_shape([None, None, 3])
+        width = raw_input.get_shape()[1]
+        seg = []
+        for i in range(13):
+            left_bound = (width * i) // 13
+            right_bound = (width * (i + 1)) // 13
+            seg[i] = raw_input[:,left_bound:right_bound,:]
+        
 
         #putting all inputs together
-        inputs = tf.concat([img_r, img_g, img_b, obj_1, obj_2, obj_3, sha_1, sha_2, sha_3, obj_0], axis=2)
+        inputs = tf.concat([seg[0], seg[1], seg[2], seg[3], seg[4], seg[5], seg[6], seg[7], seg[8], seg[9]], axis=2)
+        targets = tf.concat([seg[10], seg[11], seg[12]], axis=2)
 
-        paths_batch, inputs_batch, targets_batch, masks_batch = tf.train.batch([paths, inputs, targets, obj_0], batch_size = batch_size)
+        paths_batch, inputs_batch, targets_batch, bounds_batch = tf.train.batch([paths, inputs, targets, bounds], batch_size = batch_size)
         steps_per_epoch = int(math.ceil(len(input_paths) / batch_size))
 
         return Examples(
             paths=paths_batch,
             inputs=inputs_batch,
             targets=targets_batch,
-            masks=masks_batch
+            bounds=bounds_batch,
             count=len(input_paths),
             steps_per_epoch=steps_per_epoch,
         )
 
-def generator(generator_inputs, generator_outputs_channels):
+def generator(generator_inputs):
     layers = []
 
-    output = gen_conv(generator_inputs, ngf)
-    layers.append(output)
+    # encoders:
+    # 1: [batch, 512, 512, 10] => [batch, 256, 256, 64]
+    conv1 = gen_conv(generator_inputs, 64, 5, 1, "relu", "conv1")
+    layers.append(conv1)
+    # 2: [batch, 256, 256, 64] => [batch, 128, 128, 128]
+    conv2 = gen_conv(conv1, 128, 3, 2, "relu", "conv2")
+    layers.append(conv2)
+    # 3: [batch, 128, 128, 128] => [batch, 64, 64, 256]
+    conv3 = gen_conv(conv2, 256, 3, 2, "relu", "conv3")
+    layers.append(conv3)
+    # 4: [batch, 64, 64, 256] => [batch, 32, 32, 512]
+    conv4 = gen_conv(conv3, 512, 3, 2, "relu", "conv4")
+    layers.append(conv4)
 
-    layer_specs = [
-        ngf * 2,
-        ngf * 4,
-        ngf * 8,
-        ngf * 8,
-        ngf * 8,
-        ngf * 8,
-        ngf * 8,
-    ]
+    # dilators:
+    dilate_conv1 = gen_dilate_conv(conv4, 2, "dilate_conv1")
+    layers.append(dilate_conv1)
 
-    for out_channels in layer_specs:
-        rectified = lrelu(layers[-1], 0.2)
-        convolved = gen_conv(rectified, out_channels)
-        output = batchnorm(convolved)
-        layers.append(output)
+    dilate_conv2 = gen_dilate_conv(dilate_conv1, 4, "dilate_conv2")
+    layers.append(dilate_conv2)
 
-    layer_specs = [
-        (ngf * 8, 0.5),
-        (ngf * 8, 0,5),
-        (ngf * 8, 0.5),
-        (ngf * 8, 0.0),
-        (ngf * 4, 0.0),
-        (ngf * 2, 0.0),
-        (ngf, 0.0),
-    ]
+    dilate_conv3 = gen_dilate_conv(dilate_conv2, 8, "dilate_conv3")
+    layers.append(dilate_conv3)
 
-    for decoder_layer, (out_channels, dropout) in enumerate(layer_specs):
-        skip_layer = len(layers) - decoder_layer - 1
-        if decoder_layer == 0:
-            input = layers[-1]
-        else:
-            input = tf.concat([layers[-1], layers[skip_layer]], axis=3)
+    dilate_conv4 = gen_dilage_conv(dilate_conv3, 16, "dilate_conv4")
+    layers.append(dilate_conv4)
 
-        rectified = tf.nn.relu(input)
-        output = gen_deconv(rectified, out_channels)
-        output = batchnorm(output)
-
-        if dropout > 0.0:
-            output = tf.nn.dropout(output, keep_prob=1 - dropout)
-
-        layers.append(output)
-
-    input = tf.concat([layers[-1], layers[0]], axis=3)
-    rectified = tf.nn.relu(input)
-    output = gen_deconv(rectified, generator_outputs_channels)
-    output = tf.tanh(output)
-    layers.append(output)
-
+    # decoders:
+    # 4: [batch, 32, 32, 512] => [batch, 64, 64, 256] (no skip layer)
+    deconv4 = gen_deconv(dilate_conv4, connect_input=None, 256, 64, "deconv4")
+    layers.append(deconv4)
+    # 3: [batch, 64, 64, 256] => [batch, 128, 128, 128] (connect with layers[2])
+    deconv3 = gen_deconv(deconv4, connect_input=layers[2], 128, 128, "deconv3")
+    layers.append(deconv3)
+    # 2: [batch, 128, 128, 128] => [batch, 256, 256, 64] (connect with layers[1])
+    deconv2 = gen_deconv(deconv3, connect_input=layers[1], 64, 256, "deconv2")
+    layers.append(deconv2)
+    # 1: [batch, 256, 256, 64] => [batch, 512, 512, 4] (connect with layers[0])
+    deconv1 = gen_deconv(deconv2, connect_input=layers[0], 4, 512, "deconv1")
+    layers.append(deconv1)
+        
     return layers[-1]
 
-def create_model(inputs, targets, masks):
-    def local_discriminator(inputs, targets, masks):
-        loc_inputs = localize(inputs, masks)
-        loc_targets = localize(targets, masks)
+def create_model(inputs, targets, bounds):
+    def local_discriminator(inputs, targets, bounds):
+        #here, inputs are conditional inputs for discriminator
+        #modify later
+        loc_inputs = localize(inputs, bounds)
+        loc_targets = localize(targets, bounds)
 
-        # [128 * 128 * 6]
+        # [256 * 256 * 6]
         loc_dis_inputs = tf.concat([loc_inputs, loc_targets], axis=3)
-
         layers = []
 
-        #layer 1 => [64 * 64 * 64]
-        convolved = discrim_conv(loc_dis_inputs, ndf, stride=2)
-        rectified = lrelu(convolved, 0.2)
-        layers.append(rectified)
-
-        #layer 2 => [32 * 32 * 128]
-        convolved = discrim_conv(layers[-1], ndf * 2, stride=2)
-        rectified = lrelu(convolved, 0.2)
-        layers.append(rectified)
-
-        #layer 3 => [31 * 31 * 256]
-        convolved = discrim_conv(layers[-1], ndf * 4, stride=1)
-        rectified = lrelu(convolved, 0.2)
-        layers.append(rectified)
-
-        #layer 4 => [30 * 30 * 1]
-        convolved = discrim_conv(layers[-1], out_channels=1, stride=1)
-        output = tf.sigmoid(convolved)
-        layers.append(output)
+        #layer 1 => [128 * 128 * 64]
+        l_1 = discrim_conv(loc_dis_inputs, 64, 2, "l_1")
+        layers.append(l_1)
+        #layer 2 => [64 * 64 * 128]
+        l_2 = discrim_conv(l_1, 128, 2, "l_2")
+        layers.append(l_2)
+        #layer 3 => [32 * 32 * 256]
+        l_3 = discrim_conv(l_2, 256, 2, "l_3")
+        layers.append(l_3)
+        #layer 4 => [31 * 31 * 512]
+        l_4 = discrim_conv(l_3, 512, 1, "l_4")
+        layers.append(l_4)
+        #layer 5 => [30 * 30 * 1]
+        l_5 = discrim_conv(l_4, 1, 1, "l_5")
+        layers.append(l_5)
+        
         return layers[-1]
 
         
     def global_discriminator(inputs, targets):
-        glob_inputs = tf.concat([inputs, targets])
+        #here, inputs are conditional inputs for discriminator
+        #modify later
+        
+        #[512 * 512 * 6]
+        glob_inputs = tf.concat([inputs, targets], axis=3)
         layers = []
-
-        #layer 1
-        convolved = discrim_conv(glob_inputs, ndf, stride=2)
-        rectified = lrelu(convolved, 0.2)
-        layers.append(rectified)
-
-        #layers 2-6
-        for i in range(5):
-            out_channels = ndf * min(2**(i+1), 8)
-            convolved = discrim_conv(layers[-1], out_channels, stride=2)
-            normalized = batchnorm(convolved)
-            rectified = lrelu(normalized, 0.2)
-            layers.append(rectified)
-
-        #layer 7: flatten
-        flatten = tf.contrib.layers.flatten(layers[-1])
-        output = linear(flatten, 1024, name="flatten")
-        return output
-
-    def discriminator(inputs, targets, center_idxes):
-        loc = local_discriminator(inputs, targets, center_idxes)
-        glob = global_discriminator(inputs, targets)
-        output = tf.concat([loc, glob], axis=1)
-        return output
+                
+        #layer 1 => [256 * 256 * 64]
+        g_1 = discrim_conv(loc_dis_inputs, 64, 2, "g_1")
+        layers.append(g_1)
+        #layer 2 => [128 * 128 * 128]
+        g_2 = discrim_conv(l_1, 128, 2, "g_2")
+        layers.append(g_2)
+        #layer 3 => [64 * 64 * 256]
+        g_3 = discrim_conv(l_2, 256, 2, "g_3")
+        layers.append(g_3)
+        #layer 4 => [32 * 32 * 512]
+        g_4 = discrim_conv(l_3, 512, 2, "g_4")
+        layers.append(g_4)
+        #layer 5 => [31 * 31 * 512]
+        g_5 = discrim_conv(l_4, 512, 1, "g_5")
+        layers.append(g_5)
+        #layer 6 => [30, 30, 1]
+        g_6 = discrim_conv(l_5, 1, 1, "g_6")
+        layers.append(g_6)
+        
+        return layers[-1]
 
     with tf.variable_scope("generator"):
-        out_channels = int(targets.get_shape()[-1])
-        outputs = generator(inputs, out_channels)
+        outputs = generator(inputs)
+        '''
+        ----------------------------------------------------------------
+        insert operations for 3-channel img and mask
+        result will be [batch, 512, 512, 3] images
+        ----------------------------------------------------------------
+        '''
 
-    with tf.name_scope("real_discriminator"):
-        with tf.variable_scope("discriminator"):
-            predict_real = discriminator(inputs, targets, center_idxes)
-    with tf.name_scope("fake_discriminator"):
-        with tf.variable_scope("discriminator", reuse=True):
-            predict_fake = discriminator(inputs, outputs, center_idxes)
+    with tf.name_scope("real_local_discriminator"):
+        with tf.variable_scope("local_discriminator"):
+            local_predict_real = local_discriminator(inputs, targets, bounds)
+    with tf.name_scope("fake_local_discriminator"):
+        with tf.variable_scope("local_discriminator", reuse=True):
+            local_predict_fake = local_discriminator(inputs, outputs, bounds)
 
-    with tf.name_scope("discriminator_loss"):
-        discrim_loss = tf.reduce_mean(-(tf.log(predict_real + EPS) + tf.log(1 - predict_fake + EPS)))
+    with tf.name_scope("real_global_discriminator"):
+        with tf.variable_scope("global_discriminator"):
+            global_predict_real = global_discriminator(inputs, targets)
+    with tf.name_scope("fake_global_discriminator"):
+        with tf.variable_scope("global_discriminator"):
+            global_predict_fake = global_discriminator(inputs, outputs)
+
+    #loss functions: FIXME
+    with tf.name_scope("local_discriminator_loss"):
+        local_discrim_loss = tf.reduce_mean(-(tf.log(local_predict_real + EPS) + tf.log(1 - local_predict_fake + EPS)))
+    with tf.name_scope("global_discriminator_loss"):
+        global_discrim_loss = tf.reduce_mean(-(tf.log(global_predict_real + EPS) + tf.log(1 - global_predict_fake + EPS)))
     with tf.name_scope("generator_loss"):
-        gen_loss_GAN = tf.reduce_mean(-tf.log(predict_fake + EPS))
+        gen_loss_local = tf.reduce_mean(-tf.log(local_predict_fake + EPS))
+        gen_loss_global = tf.reduce_mean(-tf.log(global_predict_fake + EPS))
         gen_loss_L1 = tf.reduce_mean(tf.abs(targets - outputs))
-        gen_loss = gen_loss_GAN * gan_weight + gen_loss_L1 * l1_weight
+        gen_loss = gen_loss_local * local_weight + gen_loss_global * global_weight + gen_loss_L1 * l1_weight
 
-    with tf.name_scope("discriminator_train"):
-        discrim_tvars = [var for var in tf.trainable_variables() if var.name.startswith("discriminator")]
-        discrim_optim = tf.train.AdamOptimizer(lr, beta1)
-        discrim_grads_and_vars = discrim_optim.compute_gradients(discrim_loss, var_list=discrim_tvars)
-        discrim_train = discrim_optim.apply_gradients(discrim_grads_and_vars)
+    with tf.name_scope("local_discriminator_train"):
+        local_discrim_tvars = [var for var in tf.trainable_variables() if var.name.startswith("local_discriminator")]
+        local_discrim_optim = tf.train.AdamOptimizer(lr, beta1)
+        local_discrim_grads_and_vars = local_discrim_optim.compute_gradients(local_discrim_loss, var_list=local_discrim_tvars)
+        local_discrim_train = local_discrim_optim.apply_gradients(local_discrim_grads_and_vars)
+    with tf.name_scope("global_discriminator_train"):
+        global_discrim_tvars = [var for var in tf.trainable_variables() if var.name.startswith("global_discriminator")]
+        global_discrim_optim = tf.train.AdamOptimizer(lr, beta1)
+        global_discrim_grads_and_vars = global_discrim_optim.compute_gradients(global_discrim_loss, var_list=global_discrim_tvars)
+        global_discrim_train = global_discrim_optim.apply_gradients(local_discrim_grads_and_vars)
     with tf.name_scope("generator_train"):
-        with tf.control_dependencies([discrim_train]):
+        with tf.control_dependencies([local_discrim_train, global_disrim_train]):
             gen_tvars = [var for var in tf.trainable_variables() if var.name.startswith("generator")]
             gen_optim = tf.train.AdamOptimizer(lr, beta1)
             gen_grads_and_vars = gen_optim.compute_gradients(gen_loss, var_list=gen_tvars)
             gen_train = gen_optim.apply_gradients(gen_grads_and_vars)
     ema = tf.train.ExponentialMovingAverage(decay=0.99)
-    update_losses = ema.apply([discrim_loss, gen_loss_GAN, gen_loss_L1])
+    update_losses = ema.apply([local_discrim_loss, global_discrim_loss, gen_loss_local, gen_loss_global, gen_loss_L1])
 
     global_step = tf.train.get_or_create_global_step()
     incr_global_step = tf.assign(global_step, global_step + 1)
 
     return Model(
-        predict_real=predict_real,
-        predict_fake=predict_fake,
-        discrim_loss=ema.average(discrim_loss),
-        discrim_grads_and_vars=discrim_grads_and_vars,
-        gen_loss_GAN=ema.average(gen_loss_GAN),
+        local_predict_real=local_predict_real,
+        local_predict_fake=local_predict_fake,
+        global_predict_real=global_predict_real,
+        global_predict_fake=global_predict_fake,
+        local_discrim_loss=ema.average(local_discrim_loss),
+        local_discrim_grads_and_vars=local_discrim_grads_and_vars,
+        global_discrim_loss=ema.average(global_discrim_loss),
+        global_discrim_grads_and_vars=global_discrim_grads_and_vars,
+        gen_loss_local=ema.average(gen_loss_local),
+        gen_loss_global=ema.average(gen_loss_global),
         gen_loss_L1=ema.average(gen_loss_L1),
         gen_grads_and_vars=gen_grads_and_vars,
         outputs=outputs,
@@ -381,7 +436,7 @@ def main():
     examples = load_examples()
     print("examples count = %d" % examples.count)
 
-    model = create_model(examples.inputs, examples.targets, examples.center_idxes)
+    model = create_model(examples.inputs, examples.targets, examples.bounds)
     inputs = deprocess(examples.inputs)
     targets = deprocess(examples.targets)
     outputs = deprocess(model.outputs)
@@ -407,19 +462,25 @@ def main():
         tf.summary.image("targets", converted_targets)
         tf.summary.image("outputs", converted_outputs)
 
-    with tf.name_scope("predict_real_summary"):
-        tf.summary.image("predict_real", tf.image.convert_image_dtype(model.predict_real, dtype=tf.uint8))
-    with tf.name_scope("predict_fake_summary"):
-        tf.summary.image("predict_fake", tf.image.convert_image_dtype(model.predict_fake, dtype=tf.uint8))
+    with tf.name_scope("local_predict_real_summary"):
+        tf.summary.image("local_predict_real", tf.image.convert_image_dtype(model.local_predict_real, dtype=tf.uint8))
+    with tf.name_scope("local_predict_fake_summary"):
+        tf.summary.image("local_predict_fake", tf.image.convert_image_dtype(model.local_predict_fake, dtype=tf.uint8))
+    with tf.name_scope("global_predict_real_summary"):
+        tf.summary.image("global_predict_real", tf.image.convert_image_dtype(model.global_predict_real, dtype=tf.uint8))
+    with tf.name_scope("global_predict_fake_summary"):
+        tf.summary.image("global_predict_fake", tf.image.convert_image_dtype(model.global_predict_fake, dtype=tf.uint8))
 
-    tf.summary.scalar("discriminator_loss", model.discrim_loss)
-    tf.summary.scalar("generator_loss_GAN", model.gen_loss_GAN)
+    tf.summary.scalar("local_discriminator_loss", model.local_discrim_loss)
+    tf.summary.scalar("global_discriminator_loss", model.global_discrim_loss)
+    tf.summary.scalar("generator_loss_local", model.gen_loss_local)
+    tf.summary.scalar("generator_loss_global", model.gen_loss_global)
     tf.summary.scalar("generator_loss_L1", model.gen_loss_L1)
 
     for var in tf.trainable_variables():
         tf.summary.histogram(var.op.name + "/values", var)
 
-    for grad, var in model.discrim_grads_and_vars + model.gen_grads_and_vars:
+    for grad, var in model.local_discrim_grads_and_vars + model.global_discrim_grads_and_vars + model.gen_grads_and_vars:
         tf.summary.histogram(var.op.name + "/gradients", grad)
 
     with tf.name_scope("parameter_count"):
@@ -465,8 +526,10 @@ def main():
                 }
 
                 if should(progress_freq):
-                    fetches["discrim_loss"] = model.discrim_loss
-                    fetches["gen_loss_GAN"] = model.gen_loss_GAN
+                    fetches["local_discrim_loss"] = model.local_discrim_loss
+                    fetches["global_discrim_loss"] = model.global_discrim_loss
+                    fetches["gen_loss_local"] = model.gen_loss_local
+                    fetches["gen_loss_global"] = model.gen_loss_global
                     fetches["gen_loss_L1"] = model.gen_loss_L1
 
                 if should(summary_freq):
@@ -483,8 +546,10 @@ def main():
                     rate = (step + 1) * batch_size / (time.time() - start)
                     remaining = (max_steps - step) * batch_size / rate
                     print("progress  epoch %d  step %d  image/sec %0.1f  remaining %dm" % (train_epoch, train_step, rate, ramaining / 60))
-                    print("discrim_loss", results["discrim_loss"])
-                    print("gen_loss_GAN", results["gen_loss_GAN"])
+                    print("local_discrim_loss", results["local_discrim_loss"])
+                    print("global_discrim_loss", results["global_discrim_loss"])
+                    print("gen_loss_local", results["gen_loss_local"])
+                    print("gen_loss_global", results["gen_loss_global"])
                     print("gen_loss_L1", results["gen_loss_L1"])
 
                 if should(save_freq):
