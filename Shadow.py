@@ -154,59 +154,74 @@ def load_examples():
     read in all .json files, store bounds in list
     -----------------------------------------------------------------------
     '''
-
-    input_paths = glob.glob(os.path.join(a.input_dir, "*threeAddedOne.png"))
+    
 
     def get_name(path):
         name, _ = os.path.splitext(os.path.basename(path))
         return name
     
+    def get_num(path, post):
+        name = get_name(path)
+        spt = name.split(post)
+        return spt[0]
 
+    def sort_num(paths, post):
+        return sorted(paths, key=lambda path: int(get_num(path, post)))
+
+    def get_path(name):
+        paths = glob.glob(os.path.join(a.input_dir, "*"+name+".png"))
+        return sort_num(paths, name)
+
+    input_paths = get_path("threeAddedOne")
+    obj_0_paths = get_path("objectMask_0")
+    obj_1_paths = get_path("objectMask_1")
+    obj_2_paths = get_path("objectMask_2")
+    obj_3_paths = get_path("objectMask_3")
+    sha_0_paths = get_path("shadowMask_0")
+    sha_1_paths = get_path("shadowMask_1")
+    sha_2_paths = get_path("shadowMask_2")
+    sha_3_paths = get_path("shadowMask_3")
+    target_paths = get_path("image")
+
+
+    
     with tf.name_scope("load_images"):
-        path_queue = tf.train.string_input_producer(input_paths, shuffle=a.mode == "train")
         
-        def read_input(queue):
+        def read_input(paths_):
+            path_queue = tf.train.string_input_producer(paths_, shuffle=False)
             reader = tf.WholeFileReader()
             paths, contents = reader.read(path_queue)
             raw_input = tf.image.decode_png(contents)
             raw_input = tf.image.convert_image_dtype(raw_input, dtype=tf.float32)
             raw_input = preprocess(raw_input)
-            return paths, raw_input
+            return raw_input
         
-        paths, input_imgs = read_input(path_queue)
-        #change queue and paths for masks and targets, but no shuffle; keep order same
-        def change_queue(name):
-            new_paths = []
-            for p in paths:
-                spt = get_name(p).split("threeAddedOne")
-                new_p = os.path.join(a.input_dir, spt[0]+name)
-                new_paths.append(new_p)
-            return tf.train.string_input_producer(new_paths, shuffle=False)
-        
-        _, obj_1 = read_input(change_queue("objectMask_0.png"))
-        _, obj_2 = read_input(change_queue("objectMask_1.png"))
-        _, obj_3 = read_input(change_queue("objectMask_2.png"))
-        _, sha_1 = read_input(change_queue("shadowMask_0.png"))
-        _, sha_2 = read_input(change_queue("shadowMask_1.png"))
-        _, sha_3 = read_input(change_queue("shadowMask_2.png"))
-        _, obj_0 = read_input(change_queue("objectMask_3.png"))
-        _, targets = read_input(change_queue("image.png"))
-
+        input_imgs = read_input(input_paths)
+        obj_0 = read_input(obj_0_paths)
+        obj_1 = read_input(obj_1_paths)
+        obj_2 = read_input(obj_2_paths)
+        obj_3 = read_input(obj_3_paths)
+        sha_0 = read_input(sha_0_paths)
+        sha_1 = read_input(sha_1_paths)
+        sha_2 = read_input(sha_2_paths)
+        sha_3 = read_input(sha_3_paths)
+        targets = read_input(target_paths)
 
         #putting all inputs together
-        inputs = tf.concat([input_img
-                            s[:,:,0], input_imgs[:,:,1], input_imgs[:,:,2], obj_1, obj_2, obj_3, sha_1, sha_2, sha_3, obj_0], axis=2)
+        inputs = tf.concat([input_imgs[:,:,0:0], input_imgs[:,:,1:1], input_imgs[:,:,2:2], obj_1, obj_2, obj_3, sha_1, sha_2, sha_3, obj_0, sha_0], axis=2)
                 
         #bounds
         bounds = []
-        for file in paths:
-            filename = get_name(file) + "bound.json"
+        bound_paths = glob.glob(os.path.join(a.input_dir, "*bound.json"))
+        bound_paths = sort_num(bound_paths, "bound")
+        for file in bound_paths:
+            filename = get_name(file) + ".json"
             with open(filename, "w") as json_file:
                 data = json.load(json_file)
                 bound = [data["top"], data["bottom"], data["left"], data["right"]]
                 bounds.append(bound)
 
-        paths_batch, inputs_batch, targets_batch, bounds_batch = tf.train.batch([paths, inputs, targets, bounds], batch_size = batch_size)
+        paths_batch, inputs_batch, targets_batch, bounds_batch = tf.train.shuffle_batch([paths, inputs, targets, bounds], batch_size = batch_size)
         steps_per_epoch = int(math.ceil(len(input_paths) / batch_size))
 
         return Examples(
