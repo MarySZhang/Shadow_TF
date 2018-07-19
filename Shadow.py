@@ -1,6 +1,6 @@
 '''
-working log （2018/07/19）：
-to do：
+working log (2018/07/19)
+to do:
     conditional input for discriminators
     processing 4-channel output of generator
     changing loss functions
@@ -57,25 +57,21 @@ def deprocess(image):
     with tf.name_scope("deprocess"):
         return (image + 1) / 2
 
-def localize(images, bounds):
-    imgs = []
-    for i in range(len(images)):
-        temp = images[i]
-        c_row = bounds[i][0] + (bounds[i][1] - bounds[i][0]) // 2
-        c_col = bounds[i][2] + (bounds[i][3] - bounds[i][2]) // 2
-        if c_row < 128:
-            c_row = 128
-        elif c_row > 383:
-            c_row = 383
+def localize(image, bound):
+    c_row = bound[0] + (bound[1] - bound[0]) // 2
+    c_col = bound[2] + (bound[3] - bound[2]) // 2
+    if c_row < 128:
+        c_row = 128
+    elif c_row > 383:
+        c_row = 383
 
-        if c_col < 128:
-            c_col = 128
-        elif c_col > 383:
-            c_col = 383
-            
-        img = temp[c_row-128:c_row+128, c_col-128:c_col+128, : ]
-        imgs.append(img)
-    return imgs
+    if c_col < 128:
+        c_col = 128
+    elif c_col > 383:
+        c_col = 383
+
+    img = image[c_row-128:c_row+128, c_col-128:c_col+128, : ]
+    return img
 
 def discrim_conv(batch_input, out_channels, stride, name="dis_conv2d"):
     input_shape = batch_input.get_shape().as_list()
@@ -83,7 +79,7 @@ def discrim_conv(batch_input, out_channels, stride, name="dis_conv2d"):
         w = tf.get_variable("w", [5, 5, input_shape[-1], out_channels], initializer=tf.random_normal_initializer(stddev=0.02))
         b = tf.get_variable("b", [out_channels], initializer=tf.constant_initializer(0.0))
         conv = tf.nn.conv2d(batch_input, w, strides=[1, stride, stride, 1], padding="VALID")
-        output = batchnorm(output)
+        output = batchnorm(conv)
         output = tf.nn.relu(output)
         return output
             
@@ -94,7 +90,7 @@ def gen_conv(batch_input, out_channels, kernel=3, stride=2, function="relu", nam
         b = tf.get_variable("b", [out_channels], initializer=tf.constant_initializer(0.0))
         conv = tf.nn.conv2d(batch_input, w, strides=[1, stride, stride, 1], padding="SAME")
         conv = tf.reshape(tf.nn.bias_add(conv, b), conv.get_shape())
-        output = batchnorm(output)
+        output = batchnorm(conv)
         if function == "relu":
             output = tf.nn.relu(output)
         elif function == "tanh":
@@ -194,34 +190,37 @@ def load_examples():
             raw_input = tf.image.decode_png(contents)
             raw_input = tf.image.convert_image_dtype(raw_input, dtype=tf.float32)
             raw_input = preprocess(raw_input)
-            return raw_input
+            return raw_input, paths
         
-        input_imgs = read_input(input_paths)
-        obj_0 = read_input(obj_0_paths)
-        obj_1 = read_input(obj_1_paths)
-        obj_2 = read_input(obj_2_paths)
-        obj_3 = read_input(obj_3_paths)
-        sha_0 = read_input(sha_0_paths)
-        sha_1 = read_input(sha_1_paths)
-        sha_2 = read_input(sha_2_paths)
-        sha_3 = read_input(sha_3_paths)
-        targets = read_input(target_paths)
+        input_imgs, paths = read_input(input_paths)
+        obj_0, _ = read_input(obj_0_paths)
+        obj_1, _ = read_input(obj_1_paths)
+        obj_2, _ = read_input(obj_2_paths)
+        obj_3, _ = read_input(obj_3_paths)
+        sha_0, _ = read_input(sha_0_paths)
+        sha_1, _ = read_input(sha_1_paths)
+        sha_2, _ = read_input(sha_2_paths)
+        sha_3, _ = read_input(sha_3_paths)
+        targets, _ = read_input(target_paths)
 
         #putting all inputs together
         inputs = tf.concat([input_imgs[:,:,0:0], input_imgs[:,:,1:1], input_imgs[:,:,2:2], obj_1, obj_2, obj_3, sha_1, sha_2, sha_3, obj_0, sha_0], axis=2)
-                
+
+        inputs.set_shape([512, 512, 11])
+        targets.set_shape([512, 512, 3])
         #bounds
         bounds = []
         bound_paths = glob.glob(os.path.join(a.input_dir, "*bound.json"))
         bound_paths = sort_num(bound_paths, "bound")
         for file in bound_paths:
-            filename = get_name(file) + ".json"
-            with open(filename, "w") as json_file:
+            with open(file) as json_file:
                 data = json.load(json_file)
                 bound = [data["top"], data["bottom"], data["left"], data["right"]]
                 bounds.append(bound)
 
-        paths_batch, inputs_batch, targets_batch, bounds_batch = tf.train.shuffle_batch([paths, inputs, targets, bounds], batch_size = batch_size)
+        bds = tf.convert_to_tensor(bounds, dtype=tf.float32)
+
+        paths_batch, inputs_batch, targets_batch, bounds_batch = tf.train.shuffle_batch([paths, inputs, targets, bds], batch_size = batch_size, capacity=500000, min_after_dequeue=10000)
         steps_per_epoch = int(math.ceil(len(input_paths) / batch_size))
 
         return Examples(
@@ -237,8 +236,8 @@ def generator(generator_inputs):
     layers = []
 
     # encoders:
-    # 1: [batch, 512, 512, 10] => [batch, 256, 256, 64]
-    conv1 = gen_conv(generator_inputs, 64, 5, 1, "relu", "conv1")
+    # 1: [batch, 512, 512, 11] => [batch, 256, 256, 64]
+    conv1 = gen_conv(generator_inputs, 64, 5, 2, "relu", "conv1")
     layers.append(conv1)
     # 2: [batch, 256, 256, 64] => [batch, 128, 128, 128]
     conv2 = gen_conv(conv1, 128, 3, 2, "relu", "conv2")
@@ -260,7 +259,7 @@ def generator(generator_inputs):
     dilate_conv3 = gen_dilate_conv(dilate_conv2, 8, "dilate_conv3")
     layers.append(dilate_conv3)
 
-    dilate_conv4 = gen_dilage_conv(dilate_conv3, 16, "dilate_conv4")
+    dilate_conv4 = gen_dilate_conv(dilate_conv3, 16, "dilate_conv4")
     layers.append(dilate_conv4)
 
     # decoders:
