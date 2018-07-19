@@ -11,7 +11,6 @@ from __future__ import division
 from __future__ import print_function
 
 import tensorflow as tf
-import tfimage as im
 import numpy as np
 import argparse
 import os
@@ -144,10 +143,7 @@ def load_examples():
     if a.input_dir is None or not os.path.exists(a.input_dir):
         raise Exception("input_dir does not exist")
 
-    def get_path(name):
-        return glob.glob(os.path.join(a.input_dir, name))
-
-
+    
     '''
     -----------------------------------------------------------------------
     modify paths here
@@ -328,7 +324,11 @@ def create_model(inputs, targets, bounds):
         return layers[-1]
 
     with tf.variable_scope("generator"):
-        outputs = generator(inputs)
+        gen_outputs = generator(inputs)
+        img_outputs = gen_outputs[:,:,:,:2]
+        mask_outputs = gen_outputs[:,:,:,3]
+        #outputs = ?
+        outputs = img_outputs
         '''
         ----------------------------------------------------------------
         insert operations for 3-channel img and mask
