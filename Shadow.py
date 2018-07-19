@@ -70,7 +70,7 @@ def localize(images, bounds):
 
         if c_col < 128:
             c_col = 128
-        elif: c_col > 383:
+        elif c_col > 383:
             c_col = 383
             
         img = temp[c_row-128:c_row+128, c_col-128:c_col+128, : ]
@@ -155,13 +155,12 @@ def load_examples():
     -----------------------------------------------------------------------
     '''
 
-    input_paths = glob.glob(os.path.join(a.input_dir, "*imageAddedOne.png"))
+    input_paths = glob.glob(os.path.join(a.input_dir, "*threeAddedOne.png"))
 
     def get_name(path):
         name, _ = os.path.splitext(os.path.basename(path))
         return name
-
-    input_paths = sorted(input_paths, key=lambda path: int(get_name(input_paths)))
+    
 
     with tf.name_scope("load_images"):
         path_queue = tf.train.string_input_producer(input_paths, shuffle=a.mode == "train")
@@ -179,31 +178,32 @@ def load_examples():
         def change_queue(name):
             new_paths = []
             for p in paths:
-                spt = get_name(p).split("imageAddedOne")
+                spt = get_name(p).split("threeAddedOne")
                 new_p = os.path.join(a.input_dir, spt[0]+name)
                 new_paths.append(new_p)
             return tf.train.string_input_producer(new_paths, shuffle=False)
         
-        _, obj_1 = read_input(change_queue("objectMask_1.png"))
-        _, obj_2 = read_input(change_queue("objectMask_2.png"))
-        _, obj_3 = read_input(change_queue("objectMask_3.png"))
-        _, sha_1 = read_input(change_queue("shadowMask_1.png"))
-        _, sha_2 = read_input(change_queue("shadowMask_2.png"))
-        _, sha_3 = read_input(change_queue("shadowMask_3.png"))
-        _, obj_0 = read_input(change_queue("objectMask_4.png"))
+        _, obj_1 = read_input(change_queue("objectMask_0.png"))
+        _, obj_2 = read_input(change_queue("objectMask_1.png"))
+        _, obj_3 = read_input(change_queue("objectMask_2.png"))
+        _, sha_1 = read_input(change_queue("shadowMask_0.png"))
+        _, sha_2 = read_input(change_queue("shadowMask_1.png"))
+        _, sha_3 = read_input(change_queue("shadowMask_2.png"))
+        _, obj_0 = read_input(change_queue("objectMask_3.png"))
         _, targets = read_input(change_queue("image.png"))
 
 
         #putting all inputs together
-        inputs = tf.concat([input_imgs[:,:,0], input_imgs[:,:,1], input_imgs[:,:,2], obj_1, obj_2, obj_3, sha_1, sha_2, sha_3, obj_0], axis=2)
+        inputs = tf.concat([input_img
+                            s[:,:,0], input_imgs[:,:,1], input_imgs[:,:,2], obj_1, obj_2, obj_3, sha_1, sha_2, sha_3, obj_0], axis=2)
                 
         #bounds
         bounds = []
         for file in paths:
-            filename = get_name(file) + "bounds.json"
+            filename = get_name(file) + "bound.json"
             with open(filename, "w") as json_file:
                 data = json.load(json_file)
-                bound = [data["up"], data["low"], data["left"], data["right"]]
+                bound = [data["top"], data["bottom"], data["left"], data["right"]]
                 bounds.append(bound)
 
         paths_batch, inputs_batch, targets_batch, bounds_batch = tf.train.batch([paths, inputs, targets, bounds], batch_size = batch_size)
@@ -250,16 +250,16 @@ def generator(generator_inputs):
 
     # decoders:
     # 4: [batch, 32, 32, 512] => [batch, 64, 64, 256] (no skip layer)
-    deconv4 = gen_deconv(dilate_conv4, connect_input=None, 256, 64, "deconv4")
+    deconv4 = gen_deconv(dilate_conv4, connect_input=None, out_channels=256, out_height=64, name="deconv4")
     layers.append(deconv4)
     # 3: [batch, 64, 64, 256] => [batch, 128, 128, 128] (connect with layers[2])
-    deconv3 = gen_deconv(deconv4, connect_input=layers[2], 128, 128, "deconv3")
+    deconv3 = gen_deconv(deconv4, layers[2], 128, 128, "deconv3")
     layers.append(deconv3)
     # 2: [batch, 128, 128, 128] => [batch, 256, 256, 64] (connect with layers[1])
-    deconv2 = gen_deconv(deconv3, connect_input=layers[1], 64, 256, "deconv2")
+    deconv2 = gen_deconv(deconv3, layers[1], 64, 256, "deconv2")
     layers.append(deconv2)
     # 1: [batch, 256, 256, 64] => [batch, 512, 512, 4] (connect with layers[0])
-    deconv1 = gen_deconv(deconv2, connect_input=layers[0], 4, 512, "deconv1")
+    deconv1 = gen_deconv(deconv2, layers[0], 4, 512, "deconv1")
     layers.append(deconv1)
         
     return layers[-1]
@@ -563,7 +563,7 @@ def main():
                 if sv.should_stop():
                     break
 
-        main()
+main()
                 
 
  
