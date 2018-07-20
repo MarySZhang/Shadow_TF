@@ -66,19 +66,22 @@ def deprocess(image):
 
 #FIXME!!!!
 def localize(image, bound):
-    c_row = bound[0] + (bound[1] - bound[0]) // 2
-    c_col = bound[2] + (bound[3] - bound[2]) // 2
-    if c_row < 128:
-        c_row = 128
-    elif c_row > 383:
-        c_row = 383
+    #c_row = bound[:,0] + (bound[:,1] - bound[:,0]) // 2
+    #c_col = bound[:,2] + (bound[:,3] - bound[:,2]) // 2
+    #if tf.less(c_row, [128]):
+        #c_row = 128
+    #elif c_row > 383:
+#       c_row = 383
 
-    if c_col < 128:
-        c_col = 128
-    elif c_col > 383:
-        c_col = 383
+#    if c_col < 128:
+#        c_col = 128
+#    elif c_col > 383:
+#        c_col = 383
 
-    img = image[c_row-128:c_row+128, c_col-128:c_col+128, : ]
+#    img = image[c_row-128:c_row+128, c_col-128:c_col+128, : ]
+    bds = tf.cast(bound, tf.float32)
+    bds = bds / 512
+    img = tf.image.crop_and_resize(image, bds, [-1], [256, 256])
     return img
 
 def discrim_conv(batch_input, out_channels, stride, name="dis_conv2d"):
@@ -212,14 +215,13 @@ def load_examples():
         targets, _ = read_input(target_paths)
 
         #putting all inputs together
-        inputs = tf.concat([input_imgs[:,:,0:0], input_imgs[:,:,1:1], input_imgs[:,:,2:2], obj_1, obj_2, obj_3, sha_1, sha_2, sha_3, obj_0], axis=2)
-        targets = tf.concat([targets[:,:,0:0], targets[:,:,1:1], targets[:,:,2:2], sha_3], axis=2)
+        inputs = tf.concat([input_imgs, obj_1, obj_2, obj_3, sha_1, sha_2, sha_3, obj_0], axis=2)
+        targets = tf.concat([targets, sha_3], axis=2)
         
         inputs.set_shape([512, 512, 10])
         targets.set_shape([512, 512, 4])
         #bounds
         #FIXME!!!!! BOUNDS DIMENSIONS MATCH THAT OF INPUTS, NEED TO USE QUEUE AND READER!!!!
-        #bounds = []
         bound_paths = glob.glob(os.path.join(a.input_dir, "*bound.json"))
         bound_paths = sort_num(bound_paths, "bound")
         
@@ -246,9 +248,8 @@ def load_examples():
 #                bound = [data["top"], data["bottom"], data["left"], data["right"]]
 #                bounds.append(bound)
 
-        #bds = tf.convert_to_tensor(bounds, dtype=tf.float32)
 
-        paths_batch, inputs_batch, targets_batch, bounds_batch = tf.train.shuffle_batch([paths, inputs, targets, bds], batch_size = batch_size, capacity=500000, min_after_dequeue=10000)
+        paths_batch, inputs_batch, targets_batch, bounds_batch = tf.train.batch([paths, inputs, targets, bds], batch_size = batch_size)
         steps_per_epoch = int(math.ceil(len(input_paths) / batch_size))
 
         return Examples(
@@ -307,8 +308,8 @@ def generator(generator_inputs):
     return layers[-1]
 
 def create_model(inputs, targets, bounds):
-    masks = targets[:,:,:,3:3]
-    targets = targets[:,:,:,:2]
+    masks = targets[:,:,:,3:]
+    targets = targets[:,:,:,:3]
     def local_discriminator(targets, bounds):
         loc_targets = localize(targets, bounds)
 
@@ -363,18 +364,35 @@ def create_model(inputs, targets, bounds):
     #######
     # Add another discriminator for mask here...
     #######
-    #def mask_discriminator(inputs, masks):
+    def mask_discriminator(inputs, masks):
         #inputs size: [batch, 512, 512, 10]: need layers 3-9
         #mask size: [batch, 512, 512, 1]
         #out size: [batch, 30, 30, 1]
+        inputs_mask = tf.concat([inputs[:,:,:,3:10], masks], axis=3)
+        layers = []
+        #similar structure to global discriminator
+        m_1 = discrim_conv(inputs_mask, 64, 2, "m_1")
+        layers.append(m_1)
+        m_2 = discrim_conv(m_1, 128, 2, "m_2")
+        layers.append(m_2)
+        m_3 = discrim_conv(m_2, 256, 2, "m_3")
+        layers.append(m_3)
+        m_4 = discrim_conv(m_3, 512, 2, "m_4")
+        layers.append(m_4)
+        m_5 = discrim_conv(m_4, 512, 1, "m_5")
+        layers.append(m_5)
+        m_6 = discrim_conv(m_5, 1, 1, "m_6")
+        layers.append(m_6)
+        return layers[-1]
+
 
     with tf.variable_scope("generator"):
         gen_outputs = generator(inputs)
-        img_outputs = gen_outputs[:,:,:,:2]
-        mask_outputs = gen_outputs[:,:,:,3:3]
+        img_outputs = gen_outputs[:,:,:,:3]
+        mask_outputs = gen_outputs[:,:,:,3:]
         #outputs = inputs * (1-mask) + gen * mask
         mask_outputs = tf.concat([mask_outputs, mask_outputs, mask_outputs], axis=3)
-        outputs = tf.multiply(inputs, (1 - mask_outputs)) + tf.multiply(img_outputs, mask_outputs)
+        outputs = tf.multiply(inputs[:,:,:,:3], (1 - mask_outputs)) + tf.multiply(img_outputs, mask_outputs)
         outputs.set_shape([batch_size, 512, 512, 3])
 
     with tf.name_scope("real_local_discriminator"):
@@ -388,7 +406,7 @@ def create_model(inputs, targets, bounds):
         with tf.variable_scope("global_discriminator"):
             global_predict_real = global_discriminator(targets)
     with tf.name_scope("fake_global_discriminator"):
-        with tf.variable_scope("global_discriminator"):
+        with tf.variable_scope("global_discriminator", reuse=True):
             global_predict_fake = global_discriminator(outputs)
 
     #loss functions: FIXME
@@ -525,15 +543,15 @@ def main():
     for var in tf.trainable_variables():
         tf.summary.histogram(var.op.name + "/values", var)
 
-    for grad, var in model.local_discrim_grads_and_vars + model.global_discrim_grads_and_vars + model.gen_grads_and_vars:
-        tf.summary.histogram(var.op.name + "/gradients", grad)
+    #for grad, var in model.local_discrim_grads_and_vars + model.global_discrim_grads_and_vars + model.gen_grads_and_vars:
+#        tf.summary.histogram(var.op.name + "/gradients", grad)
 
     with tf.name_scope("parameter_count"):
         parameter_count = tf.reduce_sum([tf.reduce_prod(tf.shape(v)) for v in tf.trainable_variables()])
 
     saver = tf.train.Saver(max_to_keep=1)
 
-    logdir = a.output_dir if (a.trace_freq > 0 or a.summary_freq > 0) else None
+    logdir = a.output_dir if (trace_freq > 0 or summary_freq > 0) else None
     sv = tf.train.Supervisor(logdir=logdir, save_summaries_secs=0, saver=None)
     with sv.managed_session() as sess:
         print("parameter_count =", sess.run(parameter_count))
