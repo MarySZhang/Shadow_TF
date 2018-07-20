@@ -219,16 +219,34 @@ def load_examples():
         targets.set_shape([512, 512, 4])
         #bounds
         #FIXME!!!!! BOUNDS DIMENSIONS MATCH THAT OF INPUTS, NEED TO USE QUEUE AND READER!!!!
-        bounds = []
+        #bounds = []
         bound_paths = glob.glob(os.path.join(a.input_dir, "*bound.json"))
         bound_paths = sort_num(bound_paths, "bound")
-        for file in bound_paths:
-            with open(file) as json_file:
-                data = json.load(json_file)
-                bound = [data["top"], data["bottom"], data["left"], data["right"]]
-                bounds.append(bound)
+        
+        def map_jsonfile_to_bound(filename):
+            with open(filename) as f:
+                data = json.load(f)
+            return [data["top"], data["bottom"], data["left"], data["right"]]
+        
+        bound_list = list(map(map_jsonfile_to_bound, bound_paths))
+        
+        def bound_queue(bound_list):
+            bound_tensor = tf.convert_to_tensor(bound_list, dtype=tf.int32)
+            fq = tf.FIFOQueue(capacity=500000, dtypes=tf.int32)
+            fq_enqueue_op = fq.enqueue_many([bound_tensor])
+            tf.train.add_queue_runner(tf.train.QueueRunner(fq, [fq_enqueue_op] * 1))
+            return fq
+        
+        bound_q = bound_queue(bound_list)
+        bds = bound_q.dequeue()#actually only a bound at once
+        bds.set_shape([4])#needed by tf.train.shuffle_batch
+#        for file in bound_paths:
+#            with open(file) as json_file:
+#                data = json.load(json_file)
+#                bound = [data["top"], data["bottom"], data["left"], data["right"]]
+#                bounds.append(bound)
 
-        bds = tf.convert_to_tensor(bounds, dtype=tf.float32)
+        #bds = tf.convert_to_tensor(bounds, dtype=tf.float32)
 
         paths_batch, inputs_batch, targets_batch, bounds_batch = tf.train.shuffle_batch([paths, inputs, targets, bds], batch_size = batch_size, capacity=500000, min_after_dequeue=10000)
         steps_per_epoch = int(math.ceil(len(input_paths) / batch_size))
@@ -322,22 +340,22 @@ def create_model(inputs, targets, bounds):
         layers = []
                 
         #layer 1 => [256 * 256 * 64]
-        g_1 = discrim_conv(loc_dis_inputs, 64, 2, "g_1")
+        g_1 = discrim_conv(targets, 64, 2, "g_1")
         layers.append(g_1)
         #layer 2 => [128 * 128 * 128]
-        g_2 = discrim_conv(l_1, 128, 2, "g_2")
+        g_2 = discrim_conv(g_1, 128, 2, "g_2")
         layers.append(g_2)
         #layer 3 => [64 * 64 * 256]
-        g_3 = discrim_conv(l_2, 256, 2, "g_3")
+        g_3 = discrim_conv(g_2, 256, 2, "g_3")
         layers.append(g_3)
         #layer 4 => [32 * 32 * 512]
-        g_4 = discrim_conv(l_3, 512, 2, "g_4")
+        g_4 = discrim_conv(g_3, 512, 2, "g_4")
         layers.append(g_4)
         #layer 5 => [31 * 31 * 512]
-        g_5 = discrim_conv(l_4, 512, 1, "g_5")
+        g_5 = discrim_conv(g_4, 512, 1, "g_5")
         layers.append(g_5)
         #layer 6 => [30, 30, 1]
-        g_6 = discrim_conv(l_5, 1, 1, "g_6")
+        g_6 = discrim_conv(g_5, 1, 1, "g_6")
         layers.append(g_6)
         
         return layers[-1]
@@ -355,7 +373,7 @@ def create_model(inputs, targets, bounds):
         img_outputs = gen_outputs[:,:,:,:2]
         mask_outputs = gen_outputs[:,:,:,3:3]
         #outputs = inputs * (1-mask) + gen * mask
-        mask_outputs = tf.concat([mask_ouputs, mask_outputs, mask_outputs], axis=3)
+        mask_outputs = tf.concat([mask_outputs, mask_outputs, mask_outputs], axis=3)
         outputs = tf.multiply(inputs, (1 - mask_outputs)) + tf.multiply(img_outputs, mask_outputs)
         outputs.set_shape([batch_size, 512, 512, 3])
 
@@ -395,7 +413,7 @@ def create_model(inputs, targets, bounds):
         global_discrim_grads_and_vars = global_discrim_optim.compute_gradients(global_discrim_loss, var_list=global_discrim_tvars)
         global_discrim_train = global_discrim_optim.apply_gradients(local_discrim_grads_and_vars)
     with tf.name_scope("generator_train"):
-        with tf.control_dependencies([local_discrim_train, global_disrim_train]):
+        with tf.control_dependencies([local_discrim_train, global_discrim_train]):
             gen_tvars = [var for var in tf.trainable_variables() if var.name.startswith("generator")]
             gen_optim = tf.train.AdamOptimizer(lr, beta1)
             gen_grads_and_vars = gen_optim.compute_gradients(gen_loss, var_list=gen_tvars)
@@ -423,8 +441,8 @@ def create_model(inputs, targets, bounds):
         train=tf.group(update_losses, incr_global_step, gen_train),
     )
 
-def same_images(fetches, step=None):
-    image_dir = os.path.join(output_dir, "images")
+def save_images(fetches, step=None):
+    image_dir = os.path.join(a.output_dir, "images")
     if not os.path.exists(image_dir):
         os.makedirs(image_dir)
 
@@ -527,7 +545,7 @@ def main():
 
         max_steps = 2**32
         if a.max_epochs is not None:
-            max_steps = examples.steps_per_epoch * max_epochs
+            max_steps = examples.steps_per_epoch * a.max_epochs
 
 
         if a.mode == "test":
@@ -572,7 +590,7 @@ def main():
                     train_step = (results["global_step"] - 1) % examples.steps_per_epoch + 1
                     rate = (step + 1) * batch_size / (time.time() - start)
                     remaining = (max_steps - step) * batch_size / rate
-                    print("progress  epoch %d  step %d  image/sec %0.1f  remaining %dm" % (train_epoch, train_step, rate, ramaining / 60))
+                    print("progress  epoch %d  step %d  image/sec %0.1f  remaining %dm" % (train_epoch, train_step, rate, remaining / 60))
                     print("local_discrim_loss", results["local_discrim_loss"])
                     print("global_discrim_loss", results["global_discrim_loss"])
                     print("gen_loss_local", results["gen_loss_local"])
@@ -581,7 +599,7 @@ def main():
 
                 if should(save_freq):
                     print("saving model")
-                    saver.save(sess, os.path.join(output_dir, "model"), global_step=sv.global_step)
+                    saver.save(sess, os.path.join(a.output_dir, "model"), global_step=sv.global_step)
 
                 if sv.should_stop():
                     break
