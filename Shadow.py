@@ -215,7 +215,8 @@ def load_examples():
         targets, _ = read_input(target_paths)
 
         #putting all inputs together
-        inputs = tf.concat([input_imgs, obj_1, obj_2, obj_3, sha_1, sha_2, sha_3, obj_0], axis=2)
+        inputs = tf.concat([input_imgs[:,:,0:3], obj_1, obj_2, obj_3, sha_1, sha_2, sha_3, obj_0], axis=2)
+        print(inputs.get_shape())
         targets = tf.concat([targets, sha_3], axis=2)
         
         inputs.set_shape([512, 512, 10])
@@ -625,6 +626,7 @@ def main():
                     break
 
 main()
+print('the end')
                 
 
  
