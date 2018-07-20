@@ -234,7 +234,7 @@ def load_examples():
         
         def bound_queue(bound_list):
             bound_tensor = tf.convert_to_tensor(bound_list, dtype=tf.int32)
-            fq = tf.FIFOQueue(capacity=500000, dtypes=tf.int32)
+            fq = tf.FIFOQueue(capacity=32, dtypes=tf.int32)
             fq_enqueue_op = fq.enqueue_many([bound_tensor])
             tf.train.add_queue_runner(tf.train.QueueRunner(fq, [fq_enqueue_op] * 1))
             return fq
@@ -363,6 +363,8 @@ def create_model(inputs, targets, bounds):
 
     #######
     # Add another discriminator for mask here...
+    # IMPORTANT: i haven't added this discriminator to the network yet (train, loss, etc)
+    # Consider: add this? or make the other two D's conditional (which is more efficient)
     #######
     def mask_discriminator(inputs, masks):
         #inputs size: [batch, 512, 512, 10]: need layers 3-9
