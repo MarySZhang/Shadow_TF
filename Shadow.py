@@ -1,7 +1,11 @@
 '''
 working log (2018/07/19)
 to do:
-    conditional input for discriminators
+    in load_examples: manage bounds with queue, reader, and read in json files as tensor...
+        trying function tf.decode_json_example, does not work
+        localize function: dimension control debug
+    conditional input for discriminators - none?
+    add mask discriminator, loss functions, train, etc.
     processing 4-channel output of generator
     changing loss functions
 '''
@@ -30,6 +34,7 @@ parser.add_argument("--max_epochs", type=int)
 
 a = parser.parse_args()
 
+# change parameters here
 summary_freq = 100
 progress_freq = 50
 trace_freq = 0
@@ -41,8 +46,9 @@ ngf = 64
 ndf = 64
 lr = 0.0002
 beta1 = 0.5
-l1_weight = 100.0
-gan_weight = 1.0
+l1_weight = 1.0
+local_weight = 1.0
+global_weight = 1.0
 EPS = 1e-12
 CROP_SIZE = 256
 
@@ -57,6 +63,8 @@ def deprocess(image):
     with tf.name_scope("deprocess"):
         return (image + 1) / 2
 
+
+#FIXME!!!!
 def localize(image, bound):
     c_row = bound[0] + (bound[1] - bound[0]) // 2
     c_col = bound[2] + (bound[3] - bound[2]) // 2
@@ -204,11 +212,13 @@ def load_examples():
         targets, _ = read_input(target_paths)
 
         #putting all inputs together
-        inputs = tf.concat([input_imgs[:,:,0:0], input_imgs[:,:,1:1], input_imgs[:,:,2:2], obj_1, obj_2, obj_3, sha_1, sha_2, sha_3, obj_0, sha_0], axis=2)
-
-        inputs.set_shape([512, 512, 11])
-        targets.set_shape([512, 512, 3])
+        inputs = tf.concat([input_imgs[:,:,0:0], input_imgs[:,:,1:1], input_imgs[:,:,2:2], obj_1, obj_2, obj_3, sha_1, sha_2, sha_3, obj_0], axis=2)
+        targets = tf.concat([targets[:,:,0:0], targets[:,:,1:1], targets[:,:,2:2], sha_3], axis=2)
+        
+        inputs.set_shape([512, 512, 10])
+        targets.set_shape([512, 512, 4])
         #bounds
+        #FIXME!!!!! BOUNDS DIMENSIONS MATCH THAT OF INPUTS, NEED TO USE QUEUE AND READER!!!!
         bounds = []
         bound_paths = glob.glob(os.path.join(a.input_dir, "*bound.json"))
         bound_paths = sort_num(bound_paths, "bound")
@@ -236,7 +246,7 @@ def generator(generator_inputs):
     layers = []
 
     # encoders:
-    # 1: [batch, 512, 512, 11] => [batch, 256, 256, 64]
+    # 1: [batch, 512, 512, 10] => [batch, 256, 256, 64]
     conv1 = gen_conv(generator_inputs, 64, 5, 2, "relu", "conv1")
     layers.append(conv1)
     # 2: [batch, 256, 256, 64] => [batch, 128, 128, 128]
@@ -279,18 +289,16 @@ def generator(generator_inputs):
     return layers[-1]
 
 def create_model(inputs, targets, bounds):
-    def local_discriminator(inputs, targets, bounds):
-        #here, inputs are conditional inputs for discriminator
-        #modify later
-        loc_inputs = localize(inputs, bounds)
+    masks = targets[:,:,:,3:3]
+    targets = targets[:,:,:,:2]
+    def local_discriminator(targets, bounds):
         loc_targets = localize(targets, bounds)
 
-        # [256 * 256 * 6]
-        loc_dis_inputs = tf.concat([loc_inputs, loc_targets], axis=3)
+        # [256 * 256 * 3]
         layers = []
 
         #layer 1 => [128 * 128 * 64]
-        l_1 = discrim_conv(loc_dis_inputs, 64, 2, "l_1")
+        l_1 = discrim_conv(loc_targets, 64, 2, "l_1")
         layers.append(l_1)
         #layer 2 => [64 * 64 * 128]
         l_2 = discrim_conv(l_1, 128, 2, "l_2")
@@ -308,12 +316,9 @@ def create_model(inputs, targets, bounds):
         return layers[-1]
 
         
-    def global_discriminator(inputs, targets):
-        #here, inputs are conditional inputs for discriminator
-        #modify later
+    def global_discriminator(targets):
         
-        #[512 * 512 * 6]
-        glob_inputs = tf.concat([inputs, targets], axis=3)
+        #[512 * 512 * 3]
         layers = []
                 
         #layer 1 => [256 * 256 * 64]
@@ -337,32 +342,36 @@ def create_model(inputs, targets, bounds):
         
         return layers[-1]
 
+    #######
+    # Add another discriminator for mask here...
+    #######
+    #def mask_discriminator(inputs, masks):
+        #inputs size: [batch, 512, 512, 10]: need layers 3-9
+        #mask size: [batch, 512, 512, 1]
+        #out size: [batch, 30, 30, 1]
+
     with tf.variable_scope("generator"):
         gen_outputs = generator(inputs)
         img_outputs = gen_outputs[:,:,:,:2]
-        mask_outputs = gen_outputs[:,:,:,3]
-        #outputs = ?
-        outputs = img_outputs
-        '''
-        ----------------------------------------------------------------
-        insert operations for 3-channel img and mask
-        result will be [batch, 512, 512, 3] images
-        ----------------------------------------------------------------
-        '''
+        mask_outputs = gen_outputs[:,:,:,3:3]
+        #outputs = inputs * (1-mask) + gen * mask
+        mask_outputs = tf.concat([mask_ouputs, mask_outputs, mask_outputs], axis=3)
+        outputs = tf.multiply(inputs, (1 - mask_outputs)) + tf.multiply(img_outputs, mask_outputs)
+        outputs.set_shape([batch_size, 512, 512, 3])
 
     with tf.name_scope("real_local_discriminator"):
         with tf.variable_scope("local_discriminator"):
-            local_predict_real = local_discriminator(inputs, targets, bounds)
+            local_predict_real = local_discriminator(targets, bounds)
     with tf.name_scope("fake_local_discriminator"):
         with tf.variable_scope("local_discriminator", reuse=True):
-            local_predict_fake = local_discriminator(inputs, outputs, bounds)
+            local_predict_fake = local_discriminator(outputs, bounds)
 
     with tf.name_scope("real_global_discriminator"):
         with tf.variable_scope("global_discriminator"):
-            global_predict_real = global_discriminator(inputs, targets)
+            global_predict_real = global_discriminator(targets)
     with tf.name_scope("fake_global_discriminator"):
         with tf.variable_scope("global_discriminator"):
-            global_predict_fake = global_discriminator(inputs, outputs)
+            global_predict_fake = global_discriminator(outputs)
 
     #loss functions: FIXME
     with tf.name_scope("local_discriminator_loss"):
