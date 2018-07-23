@@ -205,7 +205,6 @@ def load_examples():
 
         #putting all inputs together
         inputs = tf.concat([input_imgs[:,:,0:3], obj_0, obj_1, obj_2, sha_0, sha_1, sha_2, obj_3], axis=2)
-        print(inputs.get_shape())
         targets = tf.concat([targets, sha_3], axis=2)
         
         inputs.set_shape([512, 512, 10])
@@ -455,10 +454,10 @@ def create_model(inputs, targets, bounds):
         global_discrim_loss=global_discrim_loss,
         global_discrim_grads_and_vars=global_discrim_grads_and_vars,
         mask_discrim_loss=mask_discrim_loss,
-        mask_discrim_grads_and_Vars=mask_discrim_grads_and_vars,
+        mask_discrim_grads_and_vars=mask_discrim_grads_and_vars,
         gen_loss_local=gen_loss_local,
         gen_loss_global=gen_loss_global,
-        gen_loss_mask=gen_loss_mask
+        gen_loss_mask=gen_loss_mask,
         gen_loss_L1=gen_loss_L1,
         gen_grads_and_vars=gen_grads_and_vars,
         outputs=outputs,
