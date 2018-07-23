@@ -1,13 +1,7 @@
 '''
-working log (2018/07/19)
-to do:
-    in load_examples: manage bounds with queue, reader, and read in json files as tensor...
-        trying function tf.decode_json_example, does not work
-        localize function: dimension control debug
-    conditional input for discriminators - none?
-    add mask discriminator, loss functions, train, etc.
-    processing 4-channel output of generator
-    changing loss functions
+working log (2018/07/23)
+change parameters:
+    batch_size, loss weights, stddev for noise in mask_discriminator
 '''
 
 from __future__ import absolute_import
@@ -48,11 +42,12 @@ ndf = 64
 lr = 0.0002
 beta1 = 0.5
 l1_weight = 1.0
-local_weight = 1.0
-global_weight = 1.0
-mask_weight = 1.0
+local_weight = 10.0
+global_weight = 10.0
+mask_weight = 20.0
 EPS = 1e-12
 CROP_SIZE = 256
+noise_dev = 0.05
 
 Examples = collections.namedtuple("Examples", "paths, inputs, targets, bounds, count, steps_per_epoch")
 Model = collections.namedtuple("Model", "outputs, local_predict_real, local_predict_fake, global_predict_real, global_predict_fake, mask_predict_real, mask_predict_fake, local_discrim_loss, local_discrim_grads_and_vars, global_discrim_loss, global_discrim_grads_and_vars, mask_discrim_loss, mask_discrim_grads_and_vars, gen_loss_local, gen_loss_global, gen_loss_mask, gen_loss_L1, gen_grads_and_vars, train")
@@ -68,19 +63,6 @@ def deprocess(image):
 
 #FIXME!!!!
 def localize(image, bound):
-    #c_row = bound[:,0] + (bound[:,1] - bound[:,0]) // 2
-    #c_col = bound[:,2] + (bound[:,3] - bound[:,2]) // 2
-    #if tf.less(c_row, [128]):
-        #c_row = 128
-    #elif c_row > 383:
-#       c_row = 383
-
-#    if c_col < 128:
-#        c_col = 128
-#    elif c_col > 383:
-#        c_col = 383
-
-#    img = image[c_row-128:c_row+128, c_col-128:c_col+128, : ]
     bds = tf.cast(bound, tf.float32)
     bds = bds / 512
     img = tf.image.crop_and_resize(image, bds, list(range(batch_size)), [256, 256])
@@ -350,7 +332,7 @@ def create_model(inputs, targets, bounds):
         #mask size: [batch, 512, 512, 1]
         #out size: [batch, 30, 30, 1]
         #add noise to mask layer
-        noise = tf.random_normal(shape=tf.shape(masks), mean=0.0, stddev=0.1, dtype=tf.float32)
+        noise = tf.random_normal(shape=tf.shape(masks), mean=0.0, stddev=noise_dev, dtype=tf.float32)
         noise_masks = noise + masks
         
         inputs_mask = tf.concat([inputs[:,:,:,3:], noise_masks], axis=3)
