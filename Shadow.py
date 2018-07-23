@@ -24,6 +24,7 @@ import random
 import collections
 import math
 import time
+import sys
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--input_dir")
@@ -35,11 +36,11 @@ parser.add_argument("--max_epochs", type=int)
 a = parser.parse_args()
 
 # change parameters here
-summary_freq = 100
-progress_freq = 50
+summary_freq = 10
+progress_freq = 1
 trace_freq = 0
 display_freq = 0
-save_freq = 5000
+save_freq = 5
 aspect_ratio = 1.0
 batch_size = 1
 ngf = 64
@@ -81,17 +82,22 @@ def localize(image, bound):
 #    img = image[c_row-128:c_row+128, c_col-128:c_col+128, : ]
     bds = tf.cast(bound, tf.float32)
     bds = bds / 512
-    img = tf.image.crop_and_resize(image, bds, [-1], [256, 256])
+    img = tf.image.crop_and_resize(image, bds, list(range(batch_size)), [256, 256])
     return img
 
-def discrim_conv(batch_input, out_channels, stride, name="dis_conv2d"):
+def discrim_conv(batch_input, out_channels, stride, name="dis_conv2d", function="relu"):
     input_shape = batch_input.get_shape().as_list()
     with tf.variable_scope(name) as scope:
         w = tf.get_variable("w", [5, 5, input_shape[-1], out_channels], initializer=tf.random_normal_initializer(stddev=0.02))
         b = tf.get_variable("b", [out_channels], initializer=tf.constant_initializer(0.0))
         conv = tf.nn.conv2d(batch_input, w, strides=[1, stride, stride, 1], padding="VALID")
         output = batchnorm(conv)
-        output = tf.nn.relu(output)
+        if function == "relu":
+            output = tf.nn.relu(output)
+        elif function == "sigmoid":
+            output = tf.nn.sigmoid(output)
+        else:
+            raise Exception("Invalid function")
         return output
             
 def gen_conv(batch_input, out_channels, kernel=3, stride=2, function="relu", name="gen_conv2d"):
@@ -213,9 +219,10 @@ def load_examples():
         sha_2, _ = read_input(sha_2_paths)
         sha_3, _ = read_input(sha_3_paths)
         targets, _ = read_input(target_paths)
+        targets = targets[:,:,0:3]
 
         #putting all inputs together
-        inputs = tf.concat([input_imgs[:,:,0:3], obj_1, obj_2, obj_3, sha_1, sha_2, sha_3, obj_0], axis=2)
+        inputs = tf.concat([input_imgs[:,:,0:3], obj_0, obj_1, obj_2, sha_0, sha_1, sha_2, obj_3], axis=2)
         print(inputs.get_shape())
         targets = tf.concat([targets, sha_3], axis=2)
         
@@ -330,7 +337,7 @@ def create_model(inputs, targets, bounds):
         l_4 = discrim_conv(l_3, 512, 1, "l_4")
         layers.append(l_4)
         #layer 5 => [30 * 30 * 1]
-        l_5 = discrim_conv(l_4, 1, 1, "l_5")
+        l_5 = discrim_conv(l_4, 1, 1, "l_5", function="sigmoid")
         layers.append(l_5)
         
         return layers[-1]
@@ -357,7 +364,7 @@ def create_model(inputs, targets, bounds):
         g_5 = discrim_conv(g_4, 512, 1, "g_5")
         layers.append(g_5)
         #layer 6 => [30, 30, 1]
-        g_6 = discrim_conv(g_5, 1, 1, "g_6")
+        g_6 = discrim_conv(g_5, 1, 1, "g_6", function="sigmoid")
         layers.append(g_6)
         
         return layers[-1]
@@ -395,7 +402,8 @@ def create_model(inputs, targets, bounds):
         mask_outputs = gen_outputs[:,:,:,3:]
         #outputs = inputs * (1-mask) + gen * mask
         mask_outputs = tf.concat([mask_outputs, mask_outputs, mask_outputs], axis=3)
-        outputs = tf.multiply(inputs[:,:,:,:3], (1 - mask_outputs)) + tf.multiply(img_outputs, mask_outputs)
+        mask_multiplyer = deprocess(mask_outputs)
+        outputs = tf.multiply(inputs[:,:,:,:3], (1 - mask_multiplyer)) + tf.multiply(img_outputs, mask_multiplyer)
         outputs.set_shape([batch_size, 512, 512, 3])
 
     with tf.name_scope("real_local_discriminator"):
@@ -432,15 +440,13 @@ def create_model(inputs, targets, bounds):
         global_discrim_tvars = [var for var in tf.trainable_variables() if var.name.startswith("global_discriminator")]
         global_discrim_optim = tf.train.AdamOptimizer(lr, beta1)
         global_discrim_grads_and_vars = global_discrim_optim.compute_gradients(global_discrim_loss, var_list=global_discrim_tvars)
-        global_discrim_train = global_discrim_optim.apply_gradients(local_discrim_grads_and_vars)
+        global_discrim_train = global_discrim_optim.apply_gradients(global_discrim_grads_and_vars)
     with tf.name_scope("generator_train"):
         with tf.control_dependencies([local_discrim_train, global_discrim_train]):
             gen_tvars = [var for var in tf.trainable_variables() if var.name.startswith("generator")]
             gen_optim = tf.train.AdamOptimizer(lr, beta1)
             gen_grads_and_vars = gen_optim.compute_gradients(gen_loss, var_list=gen_tvars)
             gen_train = gen_optim.apply_gradients(gen_grads_and_vars)
-    ema = tf.train.ExponentialMovingAverage(decay=0.99)
-    update_losses = ema.apply([local_discrim_loss, global_discrim_loss, gen_loss_local, gen_loss_global, gen_loss_L1])
 
     global_step = tf.train.get_or_create_global_step()
     incr_global_step = tf.assign(global_step, global_step + 1)
@@ -450,16 +456,16 @@ def create_model(inputs, targets, bounds):
         local_predict_fake=local_predict_fake,
         global_predict_real=global_predict_real,
         global_predict_fake=global_predict_fake,
-        local_discrim_loss=ema.average(local_discrim_loss),
+        local_discrim_loss=local_discrim_loss,
         local_discrim_grads_and_vars=local_discrim_grads_and_vars,
-        global_discrim_loss=ema.average(global_discrim_loss),
+        global_discrim_loss=global_discrim_loss,
         global_discrim_grads_and_vars=global_discrim_grads_and_vars,
-        gen_loss_local=ema.average(gen_loss_local),
-        gen_loss_global=ema.average(gen_loss_global),
-        gen_loss_L1=ema.average(gen_loss_L1),
+        gen_loss_local=gen_loss_local,
+        gen_loss_global=gen_loss_global,
+        gen_loss_L1=gen_loss_L1,
         gen_grads_and_vars=gen_grads_and_vars,
         outputs=outputs,
-        train=tf.group(update_losses, incr_global_step, gen_train),
+        train=tf.group(incr_global_step, gen_train),
     )
 
 def save_images(fetches, step=None):
@@ -511,8 +517,8 @@ def main():
         return tf.image.convert_image_dtype(image, dtype=tf.uint8, saturate=True)
 
     with tf.name_scope("convert_images"):
-        converted_inputs = convert(inputs)
-        converted_targets = convert(targets)
+        converted_inputs = convert(inputs[:,:,:,:3])
+        converted_targets = convert(targets[:,:,:,:3])
         converted_outputs = convert(outputs)
 
     with tf.name_scope("encode_images"):
@@ -522,7 +528,7 @@ def main():
             "targets": tf.map_fn(tf.image.encode_png, converted_targets, dtype=tf.string, name="target_pngs"),
             "outputs": tf.map_fn(tf.image.encode_png, converted_outputs, dtype=tf.string, name="output_pngs"),
         }
-    #summaries
+   #summaries
     with tf.name_scope("summaries"):
         tf.summary.image("inputs", converted_inputs)
         tf.summary.image("targets", converted_targets)
@@ -590,22 +596,27 @@ def main():
                     "train": model.train,
                     "global_step": sv.global_step,
                 }
-
+                
                 if should(progress_freq):
                     fetches["local_discrim_loss"] = model.local_discrim_loss
                     fetches["global_discrim_loss"] = model.global_discrim_loss
                     fetches["gen_loss_local"] = model.gen_loss_local
                     fetches["gen_loss_global"] = model.gen_loss_global
                     fetches["gen_loss_L1"] = model.gen_loss_L1
-
+                
                 if should(summary_freq):
                     fetches["summary"] = sv.summary_op
-
-                results = sess.run(fetches, options=None, run_metadata=None)
-
+                
+                try:
+                    results = sess.run(fetches, options=None, run_metadata=None)
+                except Exception as ex:
+                    print(ex)
+                    return
+                
                 if should(summary_freq):
                     print("recording summary")
                     sv.summary_writer.add_summary(results["summary"], results["global_step"])
+                
                 if should(progress_freq):
                     train_epoch = math.ceil(results["global_step"] / examples.steps_per_epoch)
                     train_step = (results["global_step"] - 1) % examples.steps_per_epoch + 1
@@ -617,13 +628,14 @@ def main():
                     print("gen_loss_local", results["gen_loss_local"])
                     print("gen_loss_global", results["gen_loss_global"])
                     print("gen_loss_L1", results["gen_loss_L1"])
-
+                    sys.stdout.flush()
+                
                 if should(save_freq):
                     print("saving model")
                     saver.save(sess, os.path.join(a.output_dir, "model"), global_step=sv.global_step)
-
-                if sv.should_stop():
-                    break
+                
+#                if sv.should_stop():
+#                    break
 
 main()
 print('the end')
