@@ -50,11 +50,12 @@ beta1 = 0.5
 l1_weight = 1.0
 local_weight = 1.0
 global_weight = 1.0
+mask_weight = 1.0
 EPS = 1e-12
 CROP_SIZE = 256
 
 Examples = collections.namedtuple("Examples", "paths, inputs, targets, bounds, count, steps_per_epoch")
-Model = collections.namedtuple("Model", "outputs, local_predict_real, local_predict_fake, global_predict_real, global_predict_fake, local_discrim_loss, local_discrim_grads_and_vars, global_discrim_loss, global_discrim_grads_and_vars, gen_loss_local, gen_loss_global, gen_loss_L1, gen_grads_and_vars, train")
+Model = collections.namedtuple("Model", "outputs, local_predict_real, local_predict_fake, global_predict_real, global_predict_fake, mask_predict_real, mask_predict_fake, local_discrim_loss, local_discrim_grads_and_vars, global_discrim_loss, global_discrim_grads_and_vars, mask_discrim_loss, mask_discrim_grads_and_vars, gen_loss_local, gen_loss_global, gen_loss_mask, gen_loss_L1, gen_grads_and_vars, train")
 
 def preprocess(image):
     with tf.name_scope("preprocess"):
@@ -100,7 +101,7 @@ def discrim_conv(batch_input, out_channels, stride, name="dis_conv2d", function=
             raise Exception("Invalid function")
         return output
             
-def gen_conv(batch_input, out_channels, kernel=3, stride=2, function="relu", name="gen_conv2d"):
+def gen_conv(batch_input, out_channels, kernel=3, stride=2, name="gen_conv2d"):
     input_shape = batch_input.get_shape().as_list()
     with tf.variable_scope(name) as scope:
         w = tf.get_variable("w", [kernel, kernel, input_shape[-1], out_channels], initializer=tf.random_normal_initializer(stddev=0.02))
@@ -108,13 +109,7 @@ def gen_conv(batch_input, out_channels, kernel=3, stride=2, function="relu", nam
         conv = tf.nn.conv2d(batch_input, w, strides=[1, stride, stride, 1], padding="SAME")
         conv = tf.reshape(tf.nn.bias_add(conv, b), conv.get_shape())
         output = batchnorm(conv)
-        if function == "relu":
-            output = tf.nn.relu(output)
-        elif function == "tanh":
-            output = tf.nn.tanh(output)
-        else:
-            raise Exception("Invalid function")
-
+        output = tf.nn.relu(output)
         return output
 
 def gen_deconv(batch_input, connect_input, out_channels, out_height, name="gen_deconv"):
@@ -155,19 +150,6 @@ def batchnorm(inputs):
 def load_examples():
     if a.input_dir is None or not os.path.exists(a.input_dir):
         raise Exception("input_dir does not exist")
-
-    
-    '''
-    -----------------------------------------------------------------------
-    modify paths here
-        -input(3 channels)
-        -o1, s1, o2, s2, o3, s3
-        -O
-        -gt(3 channels)
-    read in all .json files, store bounds in list
-    -----------------------------------------------------------------------
-    '''
-    
 
     def get_name(path):
         name, _ = os.path.splitext(os.path.basename(path))
@@ -229,14 +211,13 @@ def load_examples():
         inputs.set_shape([512, 512, 10])
         targets.set_shape([512, 512, 4])
         #bounds
-        #FIXME!!!!! BOUNDS DIMENSIONS MATCH THAT OF INPUTS, NEED TO USE QUEUE AND READER!!!!
         bound_paths = glob.glob(os.path.join(a.input_dir, "*bound.json"))
         bound_paths = sort_num(bound_paths, "bound")
         
         def map_jsonfile_to_bound(filename):
             with open(filename) as f:
                 data = json.load(f)
-            return [data["top"], data["bottom"], data["left"], data["right"]]
+            return [data["top"], data["left"], data["bottom"], data["right"]]
         
         bound_list = list(map(map_jsonfile_to_bound, bound_paths))
         
@@ -250,11 +231,6 @@ def load_examples():
         bound_q = bound_queue(bound_list)
         bds = bound_q.dequeue()#actually only a bound at once
         bds.set_shape([4])#needed by tf.train.shuffle_batch
-#        for file in bound_paths:
-#            with open(file) as json_file:
-#                data = json.load(json_file)
-#                bound = [data["top"], data["bottom"], data["left"], data["right"]]
-#                bounds.append(bound)
 
 
         paths_batch, inputs_batch, targets_batch, bounds_batch = tf.train.batch([paths, inputs, targets, bds], batch_size = batch_size)
@@ -274,16 +250,16 @@ def generator(generator_inputs):
 
     # encoders:
     # 1: [batch, 512, 512, 10] => [batch, 256, 256, 64]
-    conv1 = gen_conv(generator_inputs, 64, 5, 2, "relu", "conv1")
+    conv1 = gen_conv(generator_inputs, 64, 5, 2, "conv1")
     layers.append(conv1)
     # 2: [batch, 256, 256, 64] => [batch, 128, 128, 128]
-    conv2 = gen_conv(conv1, 128, 3, 2, "relu", "conv2")
+    conv2 = gen_conv(conv1, 128, 3, 2, "conv2")
     layers.append(conv2)
     # 3: [batch, 128, 128, 128] => [batch, 64, 64, 256]
-    conv3 = gen_conv(conv2, 256, 3, 2, "relu", "conv3")
+    conv3 = gen_conv(conv2, 256, 3, 2, "conv3")
     layers.append(conv3)
     # 4: [batch, 64, 64, 256] => [batch, 32, 32, 512]
-    conv4 = gen_conv(conv3, 512, 3, 2, "relu", "conv4")
+    conv4 = gen_conv(conv3, 512, 3, 2, "conv4")
     layers.append(conv4)
 
     # dilators:
@@ -369,16 +345,16 @@ def create_model(inputs, targets, bounds):
         
         return layers[-1]
 
-    #######
-    # Add another discriminator for mask here...
-    # IMPORTANT: i haven't added this discriminator to the network yet (train, loss, etc)
-    # Consider: add this? or make the other two D's conditional (which is more efficient)
-    #######
+    
     def mask_discriminator(inputs, masks):
         #inputs size: [batch, 512, 512, 10]: need layers 3-9
         #mask size: [batch, 512, 512, 1]
         #out size: [batch, 30, 30, 1]
-        inputs_mask = tf.concat([inputs[:,:,:,3:10], masks], axis=3)
+        #add noise to mask layer
+        noise = tf.random_normal(shape=tf.shape(masks), mean=0.0, stddev=0.1, dtype=tf.float32)
+        noise_masks = noise + masks
+        
+        inputs_mask = tf.concat([inputs[:,:,:,3:], noise_masks], axis=3)
         layers = []
         #similar structure to global discriminator
         m_1 = discrim_conv(inputs_mask, 64, 2, "m_1")
@@ -391,7 +367,7 @@ def create_model(inputs, targets, bounds):
         layers.append(m_4)
         m_5 = discrim_conv(m_4, 512, 1, "m_5")
         layers.append(m_5)
-        m_6 = discrim_conv(m_5, 1, 1, "m_6")
+        m_6 = discrim_conv(m_5, 1, 1, "m_6", function="sigmoid")
         layers.append(m_6)
         return layers[-1]
 
@@ -401,8 +377,8 @@ def create_model(inputs, targets, bounds):
         img_outputs = gen_outputs[:,:,:,:3]
         mask_outputs = gen_outputs[:,:,:,3:]
         #outputs = inputs * (1-mask) + gen * mask
-        mask_outputs = tf.concat([mask_outputs, mask_outputs, mask_outputs], axis=3)
-        mask_multiplyer = deprocess(mask_outputs)
+        mask_3outs = tf.concat([mask_outputs, mask_outputs, mask_outputs], axis=3)
+        mask_multiplyer = deprocess(mask_3outs)
         outputs = tf.multiply(inputs[:,:,:,:3], (1 - mask_multiplyer)) + tf.multiply(img_outputs, mask_multiplyer)
         outputs.set_shape([batch_size, 512, 512, 3])
 
@@ -419,17 +395,28 @@ def create_model(inputs, targets, bounds):
     with tf.name_scope("fake_global_discriminator"):
         with tf.variable_scope("global_discriminator", reuse=True):
             global_predict_fake = global_discriminator(outputs)
+            
+            
+    with tf.name_scope("real_mask_discriminator"):
+        with tf.variable_scope("mask_discriminator"):
+            mask_predict_real = mask_discriminator(inputs, masks)
+    with tf.name_scope("fake_mask_discriminator"):
+        with tf.variable_scope("mask_discriminator", reuse=True):
+            mask_predict_fake = mask_discriminator(inputs, mask_outputs)
 
     #loss functions: FIXME
     with tf.name_scope("local_discriminator_loss"):
         local_discrim_loss = tf.reduce_mean(-(tf.log(local_predict_real + EPS) + tf.log(1 - local_predict_fake + EPS)))
     with tf.name_scope("global_discriminator_loss"):
         global_discrim_loss = tf.reduce_mean(-(tf.log(global_predict_real + EPS) + tf.log(1 - global_predict_fake + EPS)))
+    with tf.name_scope("mask_discriminator_loss"):
+        mask_discrim_loss = tf.reduce_mean(-(tf.log(mask_predict_real + EPS) + tf.log(1 - mask_predict_fake + EPS)))
     with tf.name_scope("generator_loss"):
         gen_loss_local = tf.reduce_mean(-tf.log(local_predict_fake + EPS))
         gen_loss_global = tf.reduce_mean(-tf.log(global_predict_fake + EPS))
+        gen_loss_mask = tf.reduce_mean(-tf.log(mask_predict_fake + EPS))
         gen_loss_L1 = tf.reduce_mean(tf.abs(targets - outputs))
-        gen_loss = gen_loss_local * local_weight + gen_loss_global * global_weight + gen_loss_L1 * l1_weight
+        gen_loss = gen_loss_local * local_weight + gen_loss_global * global_weight + gen_loss_mask * mask_weight + gen_loss_L1 * l1_weight
 
     with tf.name_scope("local_discriminator_train"):
         local_discrim_tvars = [var for var in tf.trainable_variables() if var.name.startswith("local_discriminator")]
@@ -441,8 +428,13 @@ def create_model(inputs, targets, bounds):
         global_discrim_optim = tf.train.AdamOptimizer(lr, beta1)
         global_discrim_grads_and_vars = global_discrim_optim.compute_gradients(global_discrim_loss, var_list=global_discrim_tvars)
         global_discrim_train = global_discrim_optim.apply_gradients(global_discrim_grads_and_vars)
+    with tf.name_scope("mask_discriminator_train"):
+        mask_discrim_tvars = [var for var in tf.trainable_variables() if var.name.startswith("mask_discriminator")]
+        mask_discrim_optim = tf.train.AdamOptimizer(lr, beta1)
+        mask_discrim_grads_and_vars = mask_discrim_optim.compute_gradients(mask_discrim_loss, var_list=mask_discrim_tvars)
+        mask_discrim_train = mask_discrim_optim.apply_gradients(mask_discrim_grads_and_vars)
     with tf.name_scope("generator_train"):
-        with tf.control_dependencies([local_discrim_train, global_discrim_train]):
+        with tf.control_dependencies([local_discrim_train, global_discrim_train, mask_discrim_train]):
             gen_tvars = [var for var in tf.trainable_variables() if var.name.startswith("generator")]
             gen_optim = tf.train.AdamOptimizer(lr, beta1)
             gen_grads_and_vars = gen_optim.compute_gradients(gen_loss, var_list=gen_tvars)
@@ -456,12 +448,17 @@ def create_model(inputs, targets, bounds):
         local_predict_fake=local_predict_fake,
         global_predict_real=global_predict_real,
         global_predict_fake=global_predict_fake,
+        mask_predict_real=mask_predict_real,
+        mask_predict_fake=mask_predict_fake,
         local_discrim_loss=local_discrim_loss,
         local_discrim_grads_and_vars=local_discrim_grads_and_vars,
         global_discrim_loss=global_discrim_loss,
         global_discrim_grads_and_vars=global_discrim_grads_and_vars,
+        mask_discrim_loss=mask_discrim_loss,
+        mask_discrim_grads_and_Vars=mask_discrim_grads_and_vars,
         gen_loss_local=gen_loss_local,
         gen_loss_global=gen_loss_global,
+        gen_loss_mask=gen_loss_mask
         gen_loss_L1=gen_loss_L1,
         gen_grads_and_vars=gen_grads_and_vars,
         outputs=outputs,
@@ -542,11 +539,18 @@ def main():
         tf.summary.image("global_predict_real", tf.image.convert_image_dtype(model.global_predict_real, dtype=tf.uint8))
     with tf.name_scope("global_predict_fake_summary"):
         tf.summary.image("global_predict_fake", tf.image.convert_image_dtype(model.global_predict_fake, dtype=tf.uint8))
+    with tf.name_scope("mask_predict_real_summary"):
+        tf.summary.image("mask_predict_real", tf.image.convert_image_dtype(model.mask_predict_real, dtype=tf.uint8))
+    with tf.name_scope("mask_predict_fake_summary"):
+        tf.summary.image("mask_predict_fake", tf.image.convert_image_dtype(model.mask_predict_fake, dtype=tf.uint8))
+
 
     tf.summary.scalar("local_discriminator_loss", model.local_discrim_loss)
     tf.summary.scalar("global_discriminator_loss", model.global_discrim_loss)
+    tf.summary.scalar("mask_discriminator_loss", model.mask_discrim_loss)
     tf.summary.scalar("generator_loss_local", model.gen_loss_local)
     tf.summary.scalar("generator_loss_global", model.gen_loss_global)
+    tf.summary.scalar("generator_loss_mask", model.gen_loss_mask)
     tf.summary.scalar("generator_loss_L1", model.gen_loss_L1)
 
     for var in tf.trainable_variables():
@@ -600,8 +604,10 @@ def main():
                 if should(progress_freq):
                     fetches["local_discrim_loss"] = model.local_discrim_loss
                     fetches["global_discrim_loss"] = model.global_discrim_loss
+                    fetches["mask_discrim_loss"] = model.mask_discrim_loss
                     fetches["gen_loss_local"] = model.gen_loss_local
                     fetches["gen_loss_global"] = model.gen_loss_global
+                    fetches["gen_loss_mask"] = model.gen_loss_mask
                     fetches["gen_loss_L1"] = model.gen_loss_L1
                 
                 if should(summary_freq):
@@ -625,8 +631,10 @@ def main():
                     print("progress  epoch %d  step %d  image/sec %0.1f  remaining %dm" % (train_epoch, train_step, rate, remaining / 60))
                     print("local_discrim_loss", results["local_discrim_loss"])
                     print("global_discrim_loss", results["global_discrim_loss"])
+                    print("mask_discrim_loss", results["mask_discrim_loss"])
                     print("gen_loss_local", results["gen_loss_local"])
                     print("gen_loss_global", results["gen_loss_global"])
+                    print("gen_loss_mask", results["gen_loss_mask"])
                     print("gen_loss_L1", results["gen_loss_L1"])
                     sys.stdout.flush()
                 
