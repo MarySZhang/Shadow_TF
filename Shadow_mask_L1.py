@@ -2,6 +2,9 @@
 working log (2018/07/23)
 change parameters:
     batch_size, loss weights, stddev for noise in mask_discriminator
+    MAKE MASK ANOTHER L1 LOSS, WEIGHT=100
+    Structure change (which one?)
+    Dropout?
 '''
 
 from __future__ import absolute_import
@@ -30,27 +33,28 @@ parser.add_argument("--max_epochs", type=int)
 a = parser.parse_args()
 
 # change parameters here
-summary_freq = 5
-progress_freq = 1
+summary_freq = 100
+progress_freq = 50
 trace_freq = 0
 display_freq = 0
-save_freq = 5
+save_freq = 1000
 aspect_ratio = 1.0
-batch_size = 1
+batch_size = 5
 ngf = 64
 ndf = 64
 lr = 0.0002
 beta1 = 0.5
 l1_weight = 100.0
-local_weight = 10.0
+local_weight = 30.0
 global_weight = 10.0
-mask_weight = 200.0
+mask_weight = 20.0
+mask_l1_weight = 80.0
 EPS = 1e-12
 CROP_SIZE = 256
 noise_dev = 0.0001
 
 Examples = collections.namedtuple("Examples", "paths, inputs, targets, bounds, count, steps_per_epoch")
-Model = collections.namedtuple("Model", "outputs, mask_outputs, local_predict_real, local_predict_fake, global_predict_real, global_predict_fake, mask_predict_real, mask_predict_fake, local_discrim_loss, local_discrim_grads_and_vars, global_discrim_loss, global_discrim_grads_and_vars, mask_discrim_loss, mask_discrim_grads_and_vars, gen_loss_local, gen_loss_global, gen_loss_mask, gen_loss_L1, gen_grads_and_vars, train")
+Model = collections.namedtuple("Model", "outputs, mask_outputs, local_predict_real, local_predict_fake, global_predict_real, global_predict_fake, mask_predict_real, mask_predict_fake, local_discrim_loss, local_discrim_grads_and_vars, global_discrim_loss, global_discrim_grads_and_vars, mask_discrim_loss, mask_discrim_grads_and_vars, gen_loss_local, gen_loss_global, gen_loss_mask, gen_loss_L1, gen_loss_mask_L1, gen_grads_and_vars, train")
 
 def preprocess(image):
     with tf.name_scope("preprocess"):
@@ -401,7 +405,8 @@ def create_model(inputs, targets, bounds):
         gen_loss_global = tf.reduce_mean(-tf.log(global_predict_fake + EPS))
         gen_loss_mask = tf.reduce_mean(-tf.log(mask_predict_fake + EPS))
         gen_loss_L1 = tf.reduce_mean(tf.abs(targets - outputs))
-        gen_loss = gen_loss_local * local_weight + gen_loss_global * global_weight + gen_loss_mask * mask_weight + gen_loss_L1 * l1_weight
+        gen_loss_mask_L1 = tf.reduce_mean(tf.abs(masks - mask_outputs))
+        gen_loss = gen_loss_local * local_weight + gen_loss_global * global_weight + gen_loss_mask * mask_weight + gen_loss_L1 * l1_weight + gen_loss_mask_L1 * mask_l1_weight
 
     with tf.name_scope("local_discriminator_train"):
         local_discrim_tvars = [var for var in tf.trainable_variables() if var.name.startswith("local_discriminator")]
@@ -445,6 +450,7 @@ def create_model(inputs, targets, bounds):
         gen_loss_global=gen_loss_global,
         gen_loss_mask=gen_loss_mask,
         gen_loss_L1=gen_loss_L1,
+        gen_loss_mask_L1=gen_loss_mask_L1,
         gen_grads_and_vars=gen_grads_and_vars,
         outputs=outputs,
         mask_outputs=mask_outputs,
@@ -542,6 +548,7 @@ def main():
     tf.summary.scalar("generator_loss_global", model.gen_loss_global)
     tf.summary.scalar("generator_loss_mask", model.gen_loss_mask)
     tf.summary.scalar("generator_loss_L1", model.gen_loss_L1)
+    tf.summary.scalar("generator_loss_mask_L1", model.gen_loss_mask_L1)
 
     for var in tf.trainable_variables():
         tf.summary.histogram(var.op.name + "/values", var)
@@ -599,6 +606,7 @@ def main():
                     fetches["gen_loss_global"] = model.gen_loss_global
                     fetches["gen_loss_mask"] = model.gen_loss_mask
                     fetches["gen_loss_L1"] = model.gen_loss_L1
+                    fetches["gen_loss_mask_L1"] = model.gen_loss_mask_L1
                 
                 if should(summary_freq):
                     fetches["summary"] = sv.summary_op
@@ -626,6 +634,7 @@ def main():
                     print("gen_loss_global", results["gen_loss_global"])
                     print("gen_loss_mask", results["gen_loss_mask"])
                     print("gen_loss_L1", results["gen_loss_L1"])
+                    print("gen_loss_mask_L1", results["gen_loss_mask_L1"])
                     sys.stdout.flush()
                 
                 if should(save_freq):
